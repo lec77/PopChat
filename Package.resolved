@@ -1,5 +1,5 @@
 {
-  "originHash" : "9521ec2fc59d08f53ac7c154758a1798ccdd153e9e929c81da3e4e5c7789a196",
+  "originHash" : "acd7839b527176aaea59ab320d8150ec0e9a20b510c3b520e5ac7170f552a586",
   "pins" : [
     {
       "identity" : "corexlsx",
@@ -17,33 +17,6 @@
       "state" : {
         "revision" : "ac302e21da5883f4bd0490cbd0cb710b08740500",
         "version" : "1.15.0"
-      }
-    },
-    {
-      "identity" : "networkimage",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/gonzalezreal/NetworkImage",
-      "state" : {
-        "revision" : "2849f5323265386e200484b0d0f896e73c3411b9",
-        "version" : "6.0.1"
-      }
-    },
-    {
-      "identity" : "swift-cmark",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/swiftlang/swift-cmark",
-      "state" : {
-        "revision" : "924936d0427cb25a61169739a7660230bffa6ea6",
-        "version" : "0.8.0"
-      }
-    },
-    {
-      "identity" : "swift-markdown-ui",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/gonzalezreal/swift-markdown-ui",
-      "state" : {
-        "revision" : "5f613358148239d0292c0cef674a3c2314737f9e",
-        "version" : "2.4.1"
       }
     },
     {

@@ -1,5 +1,4 @@
 import SwiftUI
-import MarkdownUI
 
 extension Notification.Name {
     static let popChatOpenSettings = Notification.Name("PopChatOpenSettings")
@@ -11,6 +10,9 @@ struct ChatView: View {
     @ObservedObject var providerStore: ProviderStore
     @ObservedObject var shortcutStore: ShortcutStore
     var onClose: () -> Void
+    /// Reports the natural content height while the chat is empty, so the panel
+    /// can shrink to just header + input.
+    var onCompactHeightChange: (CGFloat) -> Void = { _ in }
 
     @State private var draft = ""
     @State private var completionIndex = 0
@@ -22,21 +24,12 @@ struct ChatView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            header
-            Divider()
-            messageList
-            Divider()
-            if !pendingAttachments.isEmpty || attachNotice != nil {
-                attachmentBar
-                Divider()
+            mainContent
+            if store.messages.isEmpty {
+                Spacer(minLength: 0)
             }
-            if !completionCandidates.isEmpty {
-                shortcutPopup
-                Divider()
-            }
-            inputBar
         }
-        .frame(minWidth: 480, minHeight: 320)
+        .frame(minWidth: 480, minHeight: store.messages.isEmpty ? nil : 320)
         .overlay {
             if dropTargeted {
                 RoundedRectangle(cornerRadius: 10)
@@ -55,6 +48,41 @@ struct ChatView: View {
         .onAppear { inputFocused = true }
         .onChange(of: state.focusBump) { _, _ in inputFocused = true }
         .onChange(of: draft) { _, _ in completionIndex = 0 }
+    }
+
+    private var mainContent: some View {
+        VStack(spacing: 0) {
+            header
+            Divider()
+            if !store.messages.isEmpty {
+                messageList
+                Divider()
+            }
+            if !pendingAttachments.isEmpty || attachNotice != nil {
+                attachmentBar
+                    .transition(.opacity)
+                Divider()
+            }
+            if !completionCandidates.isEmpty {
+                shortcutPopup
+                    .transition(.opacity)
+                Divider()
+            }
+            inputBar
+        }
+        .background(
+            GeometryReader { geometry in
+                Color.clear.preference(key: ContentHeightKey.self, value: geometry.size.height)
+            }
+        )
+        .onPreferenceChange(ContentHeightKey.self) { height in
+            if store.messages.isEmpty {
+                onCompactHeightChange(height)
+            }
+        }
+        .animation(.easeOut(duration: 0.12), value: completionCandidates.isEmpty)
+        .animation(.easeOut(duration: 0.12), value: pendingAttachments.count)
+        .animation(.easeOut(duration: 0.12), value: attachNotice)
     }
 
     // MARK: - Header
@@ -177,19 +205,15 @@ struct ChatView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 10) {
-                    if store.messages.isEmpty {
-                        Text("Ask anything — “/” for shortcuts, globe toggles web access.")
-                            .foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity)
-                            .padding(.top, 60)
-                    }
                     ForEach(store.messages) { message in
                         MessageRow(message: message, isStreaming: store.isStreaming)
+                            .transition(.opacity)
                     }
                     Color.clear.frame(height: 1).id("bottom")
                 }
                 .padding(12)
             }
+            .animation(.easeOut(duration: 0.15), value: store.messages.count)
             .onChange(of: store.messages.last?.text) { _, _ in
                 proxy.scrollTo("bottom", anchor: .bottom)
             }
@@ -352,15 +376,24 @@ struct ChatView: View {
             }
             .buttonStyle(.plain)
             .help(webEnabled ? "Web access on — model may search and read pages" : "Web access off")
-            TextField("Message…  (“/” for shortcuts)", text: $draft)
+            TextField("Message…  (“/” for shortcuts)", text: $draft, axis: .vertical)
+                .lineLimit(1...6)
                 .textFieldStyle(.plain)
                 .focused($inputFocused)
                 .onSubmit(submit)
                 .onKeyPress(phases: .down) { press in
-                    guard press.modifiers.contains(.command), press.key == KeyEquivalent("v") else {
+                    if press.modifiers.contains(.command), press.key == KeyEquivalent("v") {
+                        return handlePasteboard() ? .handled : .ignored
+                    }
+                    // Shift+Return inserts a newline at the cursor (Return sends).
+                    if press.modifiers.contains(.shift), press.key == .return {
+                        if let editor = NSApp.keyWindow?.firstResponder as? NSTextView {
+                            editor.insertNewlineIgnoringFieldEditor(nil)
+                            return .handled
+                        }
                         return .ignored
                     }
-                    return handlePasteboard() ? .handled : .ignored
+                    return .ignored
                 }
                 .onKeyPress(.upArrow) {
                     guard !completionCandidates.isEmpty else { return .ignored }
@@ -412,44 +445,10 @@ struct ChatView: View {
     }
 }
 
-private struct CodeBlockView: View {
-    let configuration: CodeBlockConfiguration
-
-    @State private var copied = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text(configuration.language ?? "code")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(configuration.content, forType: .string)
-                    copied = true
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
-                } label: {
-                    Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
-                        .font(.caption)
-                }
-                .buttonStyle(.plain)
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 5)
-            Divider()
-            ScrollView(.horizontal, showsIndicators: false) {
-                configuration.label
-                    .markdownTextStyle {
-                        FontFamilyVariant(.monospaced)
-                        FontSize(.em(0.85))
-                    }
-                    .padding(10)
-            }
-        }
-        .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
-        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.quaternary))
-        .padding(.vertical, 2)
+private struct ContentHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }
 
@@ -520,8 +519,7 @@ private struct MessageRow: View {
                     }
                 }
                 if !message.text.isEmpty {
-                    Text(message.text)
-                        .textSelection(.enabled)
+                    SelectableText(attributed: MarkdownRenderer.plain(message.text))
                 }
             }
             .padding(.horizontal, 12)
@@ -535,11 +533,7 @@ private struct MessageRow: View {
                         .controlSize(.small)
                         .padding(.vertical, 8)
                 } else {
-                    Markdown(message.text)
-                        .markdownBlockStyle(\.codeBlock) { configuration in
-                            CodeBlockView(configuration: configuration)
-                        }
-                        .textSelection(.enabled)
+                    AssistantMessageView(text: message.text)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)

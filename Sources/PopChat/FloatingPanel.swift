@@ -21,7 +21,9 @@ final class FloatingPanel: NSPanel {
         titlebarAppearsTransparent = true
         isMovableByWindowBackground = true
         hidesOnDeactivate = false
-        animationBehavior = .utilityWindow
+        // The controller hand-animates show/hide (fade + rise); the system
+        // animation would double up.
+        animationBehavior = .none
         isReleasedWhenClosed = false
 
         standardWindowButton(.closeButton)?.isHidden = true
