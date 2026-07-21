@@ -1,6 +1,5 @@
 import SwiftUI
 import AppKit
-import KeyboardShortcuts
 
 /// Attachment state lives here so drops (handled at the panel root) and the
 /// composer share it without the root view observing keystrokes.
@@ -224,7 +223,6 @@ struct ComposerView: View {
     @ObservedObject var model: ComposerModel
     let shortcutStore: ShortcutStore
     let isStreaming: Bool
-    let isEmptyChat: Bool
     let focusBump: Int
     @Binding var editorMode: Bool
     let onSend: (String, [Attachment]) -> Void
@@ -271,9 +269,6 @@ struct ComposerView: View {
                     .transition(.opacity)
             }
             inputCapsule
-            if isEmptyChat {
-                hintRow
-            }
         }
         .padding(.top, 10)
         .padding(.horizontal, 12)
@@ -348,7 +343,8 @@ struct ComposerView: View {
                         .contentShape(Circle())
                 }
                 .buttonStyle(.plain)
-                .help("Close editor (Esc)")
+                .keyboardShortcut("e", modifiers: .command) // ⌘E toggles the editor
+                .help("Close editor (⌘E or Esc)")
             }
             if !model.pendingAttachments.isEmpty || model.attachNotice != nil {
                 attachCard
@@ -553,17 +549,6 @@ struct ComposerView: View {
 
     private var canSend: Bool {
         !draft.trimmingCharacters(in: .whitespaces).isEmpty || !model.pendingAttachments.isEmpty
-    }
-
-    private var hintRow: some View {
-        Text("\(hotkeyLabel) toggles · ⇧↩ newline · Tab completes · ⌘E expands")
-            .font(.system(size: 10.5))
-            .foregroundStyle(.tertiary)
-            .frame(maxWidth: .infinity)
-    }
-
-    private var hotkeyLabel: String {
-        KeyboardShortcuts.getShortcut(for: .togglePopChat).map(String.init(describing:)) ?? "⌥Space"
     }
 
     private func submitFromButton() {

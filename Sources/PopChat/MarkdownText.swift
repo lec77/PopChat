@@ -15,6 +15,9 @@ enum MarkdownRenderer {
         case quote(String)
         case table(header: [String], rows: [[String]])
         case math(String)
+        /// Reusable content the model marked with <pasteable> tags (per the
+        /// default system prompt) — rendered as a dedicated copyable card.
+        case pasteable(title: String?, content: String)
 
         var isProse: Bool {
             if case .prose = self { return true }
@@ -50,6 +53,33 @@ enum MarkdownRenderer {
                     i += 1
                 }
                 result.append(.code(language: hint.isEmpty ? nil : hint, content: code.joined(separator: "\n")))
+                i += 1
+                continue
+            }
+
+            // Content is captured verbatim until the closing tag, so pasteable
+            // blocks may safely contain code fences (and fences may contain
+            // literal <pasteable> text — the fence branch above consumes it).
+            if trimmed.hasPrefix("<pasteable"), trimmed.hasSuffix(">") {
+                flushProse()
+                var title: String?
+                if let match = trimmed.range(of: #"title\s*=\s*"([^"]*)""#, options: .regularExpression) {
+                    let attribute = String(trimmed[match])
+                    if let open = attribute.firstIndex(of: "\""), let close = attribute.lastIndex(of: "\""), open < close {
+                        let value = String(attribute[attribute.index(after: open)..<close])
+                        title = value.isEmpty ? nil : value
+                    }
+                }
+                var content: [String] = []
+                i += 1
+                while i < lines.count, lines[i].trimmingCharacters(in: .whitespaces) != "</pasteable>" {
+                    content.append(lines[i])
+                    i += 1
+                }
+                result.append(.pasteable(
+                    title: title,
+                    content: content.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                ))
                 i += 1
                 continue
             }
@@ -504,6 +534,8 @@ struct AssistantMessageView: View {
                     TableBlockView(header: header, rows: rows)
                 case .math(let latex):
                     MathBlockView(latex: latex)
+                case .pasteable(let title, let content):
+                    PasteableBlockView(title: title, content: content)
                 }
             }
             if showCaret, !(segments.last?.isProse ?? false) {
@@ -640,6 +672,63 @@ struct TableBlockView: View {
         result.addAttributes([.font: font, .foregroundColor: NSColor.labelColor],
                              range: NSRange(location: 0, length: result.length))
         return result
+    }
+}
+
+/// Reusable content marked by the model for one-click copying. Shown verbatim
+/// (no markdown parsing) — what you see is exactly what the Copy button copies.
+struct PasteableBlockView: View {
+    let title: String?
+    let content: String
+
+    @State private var copied = false
+    @AppStorage("accentColor") private var accentHex = Theme.defaultAccentHex
+
+    private var accent: SwiftUI.Color { Theme.color(accentHex) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 6) {
+                Image(systemName: "doc.on.clipboard")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(accent)
+                Text(title ?? "Pasteable")
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer()
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(content, forType: .string)
+                    copied = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
+                } label: {
+                    Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(accent)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(accent.opacity(0.15), in: Capsule())
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .help("Copy this block")
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(accent.opacity(0.08))
+            Divider()
+                .overlay(accent.opacity(0.25))
+            SelectableText(attributed: MarkdownRenderer.plain(content))
+                .padding(10)
+        }
+        .background(accent.opacity(0.05))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(accent.opacity(0.35), lineWidth: 1)
+        )
+        .padding(.vertical, 2)
     }
 }
 

@@ -5,7 +5,9 @@ import AppKit
 //   POPCHAT_API_KEY=… .build/debug/PopChat --smoke-search   agentic loop w/ DuckDuckGo
 let smokePlain = CommandLine.arguments.contains("--smoke")
 let smokeSearch = CommandLine.arguments.contains("--smoke-search")
-if smokePlain || smokeSearch {
+// Verifies the default system prompt actually elicits <pasteable> blocks.
+let smokePasteable = CommandLine.arguments.contains("--smoke-pasteable")
+if smokePlain || smokeSearch || smokePasteable {
     Task {
         let env = ProcessInfo.processInfo.environment
         let config = ProviderConfig(
@@ -15,10 +17,18 @@ if smokePlain || smokeSearch {
         )
         let prompt = smokeSearch
             ? "What is the latest stable release version of the Zed editor? Use web_search to check — do not answer from memory. Reply with just the version number and the source URL."
-            : "Reply with exactly: PopChat streaming OK"
-        print("smoke: \(config.baseURL) model=\(config.model) search=\(smokeSearch)")
+            : smokePasteable
+                ? "Give me a reusable conventional-commit message template for bug fixes, ready to copy."
+                : "Reply with exactly: PopChat streaming OK"
+        print("smoke: \(config.baseURL) model=\(config.model) search=\(smokeSearch) pasteable=\(smokePasteable)")
         var chunks = 0
-        let history = [OpenAIChatClient.WireMessage(role: "user", content: .text(prompt))]
+        var history = [OpenAIChatClient.WireMessage(role: "user", content: .text(prompt))]
+        if smokePasteable {
+            history.insert(
+                OpenAIChatClient.WireMessage(role: "system", content: .text(ChatStore.defaultSystemPrompt)),
+                at: 0
+            )
+        }
         for await event in OpenAIChatClient.run(
             history: history,
             config: config,
@@ -31,6 +41,16 @@ if smokePlain || smokeSearch {
                 print("[activity] \(text)")
             case .done(let text):
                 print("chunks=\(chunks)\nfinal=\(text)")
+                if smokePasteable {
+                    let blocks = MarkdownRenderer.segments(text).compactMap { segment -> String? in
+                        if case .pasteable(let title, let content) = segment {
+                            return "title=\(title ?? "-") chars=\(content.count)"
+                        }
+                        return nil
+                    }
+                    print("pasteableBlocks=\(blocks.count) \(blocks.joined(separator: " | "))")
+                    exit(blocks.isEmpty ? 1 : 0)
+                }
                 exit(text.isEmpty ? 1 : 0)
             case .error(let message):
                 print("ERROR: \(message)")

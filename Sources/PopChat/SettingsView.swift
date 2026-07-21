@@ -33,6 +33,7 @@ struct SettingsView: View {
     @State private var tab: Tab = .general
     @State private var apiKeyDraft = ""
     @State private var searchKeyDraft = ""
+    @State private var systemPromptDraft = ChatStore.systemPrompt
     @AppStorage("searchEngine") private var searchEngine = SearchEngineChoice.duckduckgo.rawValue
     @AppStorage("webSearchEnabled") private var webEnabled = true
     @AppStorage("accentColor") private var accentHex = Theme.defaultAccentHex
@@ -303,6 +304,29 @@ struct SettingsView: View {
 
     private var commandsTab: some View {
         Form {
+            Section {
+                TextField(
+                    "System prompt sent at the start of every conversation",
+                    text: $systemPromptDraft,
+                    axis: .vertical
+                )
+                .lineLimit(4...12)
+                .font(.callout)
+                .onChange(of: systemPromptDraft) { _, newValue in
+                    UserDefaults.standard.set(newValue, forKey: "systemPrompt")
+                }
+                Button("Reset to Default") {
+                    systemPromptDraft = ChatStore.defaultSystemPrompt
+                }
+                .disabled(systemPromptDraft == ChatStore.defaultSystemPrompt)
+            } header: {
+                Text("System Prompt")
+            } footer: {
+                Text("Sent with every conversation. The default teaches the model PopChat's pasteable-block format; clear it to send no system prompt.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .help("Content the model wraps in <pasteable title=\"…\"> … </pasteable> tags is rendered as a copyable card in the transcript.")
+            }
             Section {
                 ForEach($shortcutStore.shortcuts) { $shortcut in
                     VStack(alignment: .leading, spacing: 4) {

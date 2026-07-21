@@ -79,6 +79,32 @@ final class ChatStore: ObservableObject {
         set { UserDefaults.standard.set(newValue, forKey: "webSearchEnabled") }
     }
 
+    /// Teaches the model the pasteable-block format the renderer recognizes.
+    /// Editable in Settings → Commands; an explicitly empty value means "send
+    /// no system prompt".
+    nonisolated static let defaultSystemPrompt = """
+    You are PopChat, a helpful assistant in a small desktop chat panel. Be concise and direct.
+
+    When a reply includes content the user will copy and reuse verbatim — a prompt, template, \
+    code snippet, configuration, or other reusable text — wrap exactly that content in a \
+    pasteable block:
+
+    <pasteable title="Short label">
+    the exact reusable content
+    </pasteable>
+
+    Pasteable rules:
+    - The tags go on their own lines, with a short descriptive title.
+    - Inside the tags, put only the content to copy — no commentary.
+    - Keep explanations outside the block, in normal prose.
+    - Use pasteable blocks only for content meant to be copied; use normal markdown code \
+    fences for illustrative code.
+    """
+
+    static var systemPrompt: String {
+        UserDefaults.standard.string(forKey: "systemPrompt") ?? defaultSystemPrompt
+    }
+
     func send(_ text: String, attachments: [Attachment] = []) {
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || !attachments.isEmpty, !isStreaming else { return }
@@ -131,9 +157,13 @@ final class ChatStore: ObservableObject {
 
         let webAccess = resolveWebAccess(providerBaseURL: config.baseURL)
 
-        let history = messages
+        var history = messages
             .filter { $0.role == .user || $0.role == .assistant }
             .map { OpenAIChatClient.WireMessage(role: $0.role.rawValue, content: Self.wireContent(for: $0)) }
+        let systemPrompt = Self.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !systemPrompt.isEmpty {
+            history.insert(OpenAIChatClient.WireMessage(role: "system", content: .text(systemPrompt)), at: 0)
+        }
 
         persist()
         let assistantMessage = ChatMessage(role: .assistant, text: "")

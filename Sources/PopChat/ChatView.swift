@@ -93,7 +93,6 @@ struct ChatView: View {
                 model: composerModel,
                 shortcutStore: shortcutStore,
                 isStreaming: store.isStreaming,
-                isEmptyChat: store.messages.isEmpty,
                 focusBump: state.focusBump,
                 editorMode: $draftEditorShown,
                 onSend: { text, attachments in store.send(text, attachments: attachments) },
