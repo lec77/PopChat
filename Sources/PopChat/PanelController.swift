@@ -13,6 +13,9 @@ final class PanelController: NSObject, NSWindowDelegate {
     private var isHiding = false
     /// Last content height reported by the compact (no messages) layout.
     private var lastCompactHeight: CGFloat?
+    /// Distinguishes "a stored chat was restored" from "the first message was
+    /// sent" when the panel stops being empty — they get different growth curves.
+    private var lastRestoreTick = 0
 
     // Delta 2 (4a): 520pt min width keeps the header pills from colliding with
     // long model names; 120pt empty-min gives the input capsule breathing room.
@@ -45,6 +48,8 @@ final class PanelController: NSObject, NSWindowDelegate {
         self.shortcutStore = shortcutStore
         self.chatStore = ChatStore(providerStore: providerStore, shortcutStore: shortcutStore)
         super.init()
+        // The launch resume already bumped the tick; only later restores count.
+        lastRestoreTick = chatStore.restoreTick
 
         // Grow to the remembered height when the first message lands; the shrink
         // back to compact is driven by the ChatView height report.
@@ -254,7 +259,21 @@ final class PanelController: NSObject, NSWindowDelegate {
 
     private func emptinessChanged(_ empty: Bool) {
         if !empty {
-            setContentHeight(expandedHeight, animated: true)
+            // Restoring a chat from history is the 5d sequence: the popover has
+            // already animated out, so the growth gets its own slower spring-like
+            // curve. A first message typed into an empty chat keeps the quick one
+            // — 0.32s there would read as lag, not choreography.
+            let restoring = chatStore.restoreTick != lastRestoreTick
+            lastRestoreTick = chatStore.restoreTick
+            setContentHeight(
+                expandedHeight,
+                // Reduce Motion: height snaps to final, the transcript still fades.
+                animated: !reduceMotion,
+                duration: restoring ? 0.32 : 0.15,
+                timing: restoring
+                    ? CAMediaTimingFunction(controlPoints: 0.22, 1, 0.36, 1)
+                    : CAMediaTimingFunction(name: .easeOut)
+            )
         }
         // When emptied (new chat), ChatView reports the compact height on next layout.
         // The minimum switches implicitly — windowWillResize reads emptiness live.
@@ -267,8 +286,14 @@ final class PanelController: NSObject, NSWindowDelegate {
         setContentHeight(clamped, animated: panel.isVisible)
     }
 
-    /// Resizes keeping the top edge fixed, so the panel grows downward.
-    private func setContentHeight(_ contentHeight: CGFloat, animated: Bool) {
+    /// Resizes keeping the top edge fixed, so the panel grows downward — the
+    /// pills never move and the composer rides the bottom edge (5d).
+    private func setContentHeight(
+        _ contentHeight: CGFloat,
+        animated: Bool,
+        duration: CFTimeInterval = 0.15,
+        timing: CAMediaTimingFunction = CAMediaTimingFunction(name: .easeOut)
+    ) {
         let currentContent = panel.contentRect(forFrameRect: panel.frame)
         guard abs(currentContent.height - contentHeight) > 1 else { return }
         var newContent = currentContent
@@ -277,8 +302,8 @@ final class PanelController: NSObject, NSWindowDelegate {
         let newFrame = panel.frameRect(forContentRect: newContent)
         if animated {
             NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0.15
-                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                context.duration = duration
+                context.timingFunction = timing
                 panel.animator().setFrame(newFrame, display: true)
             }
         } else {
@@ -293,6 +318,15 @@ final class PanelController: NSObject, NSWindowDelegate {
     /// the window's min/max to zero during layout regardless of sizingOptions.
     func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
         let minFrame = sender.frameRect(forContentRect: NSRect(origin: .zero, size: minContentSize)).size
+        // Empty chat: the panel is sized to its own content (pills + capsule), so a
+        // vertical drag can only open dead space under the input — and that height
+        // is thrown away by the next compact height report anyway. Width stays free;
+        // the user's preferred expanded height is remembered separately.
+        if chatStore.messages.isEmpty {
+            let content = NSSize(width: 0, height: lastCompactHeight ?? Self.compactMinHeight)
+            let locked = sender.frameRect(forContentRect: NSRect(origin: .zero, size: content)).height
+            return NSSize(width: max(frameSize.width, minFrame.width), height: locked)
+        }
         return NSSize(
             width: max(frameSize.width, minFrame.width),
             height: max(frameSize.height, minFrame.height)

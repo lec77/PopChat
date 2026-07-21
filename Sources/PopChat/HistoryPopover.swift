@@ -2,10 +2,17 @@ import SwiftUI
 
 /// Recent-conversations popover, anchored off the clock pill (⌘Y). Type-to-filter,
 /// ↑/↓ to select and ↩ to open, day-group headers, delete (trash click or ⌘⌫).
+///
+/// Delta 3 (5b/5c/5d): the sheet pops out of the clock pill with a row cascade
+/// instead of the stock NSPopover fade, opens at its FINAL size (see `Metrics` —
+/// a LazyVStack made NSPopover present at an estimated size and re-size
+/// mid-animation, which against the 120pt empty panel is the whole show), and
+/// dismisses on a designed curve BEFORE the panel starts growing.
 struct HistoryPopover: View {
     @ObservedObject var store: ChatStore
     @AppStorage("accentColor") private var accentHex = Theme.defaultAccentHex
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     @State private var filter = ""
     @State private var hoveredID: UUID?
@@ -13,74 +20,170 @@ struct HistoryPopover: View {
     /// instant the popover opens.
     @State private var selectedID: UUID?
     @State private var filterFocusBump = 0
+    /// Drives the whole designed presentation (5b): flipped true in onAppear for
+    /// the pop-in, and back to false to run the out-animation before the popover
+    /// itself closes.
+    @State private var appeared = false
+    /// Set once `close` is running, so the same `appeared` change animates on the
+    /// dismiss curve with no row cascade.
+    @State private var isClosing = false
+    /// The row flashing accent under the press (5d), ahead of the dismiss.
+    @State private var pressedID: UUID?
+
+    /// Fixed geometry, so the popover's height is known before it is presented
+    /// and never changes afterwards (5c).
+    private enum Metrics {
+        static let width: CGFloat = 300
+        static let rowWithSnippet: CGFloat = 46
+        static let rowPlain: CGFloat = 30
+        static let groupHeader: CGFloat = 20
+        static let itemSpacing: CGFloat = 2
+        static let listInset: CGFloat = 8
+        static let maxListHeight: CGFloat = 380
+        static let emptyHeight: CGFloat = 56
+        /// History rows are cheap, but not free — the filter trims anything past
+        /// this and the list stays a plain VStack.
+        static let renderCap = 40
+    }
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 6) {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                KeyRoutingTextField(
-                    text: $filter,
-                    placeholder: "Filter chats…",
-                    focusBump: filterFocusBump,
-                    onMoveUp: { moveSelection(-1) },
-                    onMoveDown: { moveSelection(1) },
-                    onReturn: { _ in openSelected() },
-                    onEscape: {
-                        dismiss()
-                        return true
-                    }
-                )
-                .frame(height: 16)
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            filterRow
             Divider()
-            if filtered.isEmpty {
+            if visible.isEmpty {
                 Text(store.recent.isEmpty ? "No saved chats" : "No matches")
                     .font(.system(size: 11.5))
                     .foregroundStyle(.secondary)
-                    .padding(.vertical, 20)
+                    .frame(height: Metrics.emptyHeight)
             } else {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 2) {
-                            ForEach(groups) { group in
-                                Text(group.title)
-                                    .font(.system(size: 10, weight: .semibold))
-                                    .foregroundStyle(.primary.opacity(0.4))
-                                    .textCase(.uppercase)
-                                    .padding(.horizontal, 8)
-                                    .padding(.top, 8)
-                                    .padding(.bottom, 2)
-                                ForEach(group.items) { meta in
-                                    row(meta)
-                                }
-                            }
-                        }
-                        .padding(8)
-                    }
-                    .frame(maxHeight: 380)
-                    .onChange(of: selectedID) { _, id in
-                        guard let id else { return }
-                        withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(id, anchor: .center) }
-                    }
-                }
+                list
             }
         }
-        .frame(width: 300)
+        .frame(width: Metrics.width)
+        // Pop from the clock pill rather than materialize: origin top-right,
+        // scale 0.92→1, y −6→0. Reduce Motion collapses it to opacity only.
+        .scaleEffect(appeared || reduceMotion ? 1 : 0.92, anchor: .topTrailing)
+        .offset(y: appeared || reduceMotion ? 0 : -6)
+        .opacity(appeared ? 1 : 0)
+        .animation(shellAnimation, value: appeared)
         // ⌘F inside the popover means "search the histories": the filter field is
         // already focused on open, so this re-focuses and selects it.
         .keyCommand("f") { filterFocusBump += 1 }
-        .onAppear { selectedID = filtered.first?.id }
-        .onChange(of: filter) { _, _ in selectedID = filtered.first?.id }
+        .onAppear {
+            selectedID = visible.first?.id
+            appeared = true
+        }
+        .onChange(of: filter) { _, _ in selectedID = visible.first?.id }
+    }
+
+    // The filter row lands with the shell — only the list rows cascade.
+    private var filterRow: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            KeyRoutingTextField(
+                text: $filter,
+                placeholder: "Filter chats…",
+                focusBump: filterFocusBump,
+                onMoveUp: { moveSelection(-1) },
+                onMoveDown: { moveSelection(1) },
+                onReturn: { _ in openSelected() },
+                onEscape: {
+                    close()
+                    return true
+                }
+            )
+            .frame(height: 16)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+
+    private var list: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                // Plain VStack with fixed item heights: a LazyVStack re-estimates
+                // as rows realize, which is exactly what made the popover resize
+                // mid-pop (5c).
+                VStack(alignment: .leading, spacing: Metrics.itemSpacing) {
+                    ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                        itemView(item)
+                            .opacity(appeared ? 1 : 0)
+                            .offset(y: appeared || reduceMotion ? 0 : 4)
+                            .animation(cascade(index), value: appeared)
+                    }
+                }
+                .padding(Metrics.listInset)
+            }
+            .scrollBounceBehavior(.basedOnSize)
+            .frame(height: listHeight)
+            .onChange(of: selectedID) { _, id in
+                guard let id else { return }
+                withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(id, anchor: .center) }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func itemView(_ item: ListItem) -> some View {
+        switch item {
+        case let .header(title, _):
+            Text(title)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.primary.opacity(0.4))
+                .textCase(.uppercase)
+                .padding(.horizontal, 8)
+                .frame(height: Metrics.groupHeader, alignment: .bottomLeading)
+        case let .chat(meta):
+            row(meta)
+        }
+    }
+
+    // MARK: - Motion
+
+    private var shellAnimation: Animation {
+        if reduceMotion { return .easeOut(duration: 0.15) }
+        return isClosing ? .easeIn(duration: 0.13) : .spring(response: 0.24, dampingFraction: 0.85)
+    }
+
+    /// 18ms stagger capped at the first 8 rows, so a long list never feels slow —
+    /// everything past row 8 arrives with it. No stagger on the way out.
+    private func cascade(_ index: Int) -> Animation {
+        if reduceMotion || isClosing { return .easeOut(duration: 0.13) }
+        return .easeOut(duration: 0.16).delay(Double(min(index, 8)) * 0.018)
+    }
+
+    /// Runs the designed out-animation, then dismisses, then hands over. The
+    /// ordering is the point (5d): the popover is gone before the panel grows,
+    /// because two springs at once is what made this read as jumpy.
+    private func close(afterFlash: Bool = false, then action: (() -> Void)? = nil) {
+        guard !isClosing else { return }
+        let run = {
+            isClosing = true
+            appeared = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.13) {
+                dismiss()
+                action?()
+            }
+        }
+        if afterFlash {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: run)
+        } else {
+            run()
+        }
+    }
+
+    private func open(_ meta: ConversationMeta) {
+        guard !isClosing else { return }
+        pressedID = meta.id
+        close(afterFlash: true) { store.loadConversation(meta.id) }
     }
 
     // MARK: - Keyboard selection
 
     private func moveSelection(_ delta: Int) -> Bool {
-        let items = filtered
+        let items = visible
         guard !items.isEmpty else { return true }
         let current = items.firstIndex { $0.id == selectedID } ?? -1
         selectedID = items[min(max(current + delta, 0), items.count - 1)].id
@@ -88,9 +191,8 @@ struct HistoryPopover: View {
     }
 
     private func openSelected() -> Bool {
-        guard let meta = filtered.first(where: { $0.id == selectedID }) ?? filtered.first else { return true }
-        store.loadConversation(meta.id)
-        dismiss()
+        guard let meta = visible.first(where: { $0.id == selectedID }) ?? visible.first else { return true }
+        open(meta)
         return true
     }
 
@@ -98,12 +200,12 @@ struct HistoryPopover: View {
         let isCurrent = meta.id == store.conversationID
         let isHovered = hoveredID == meta.id
         let isSelected = selectedID == meta.id
+        let isPressed = pressedID == meta.id
         // Only one row may carry the ⌘⌫ equivalent at a time: hover wins while
         // the mouse is over the list, keyboard selection owns it otherwise.
         let ownsDelete = isHovered || (isSelected && hoveredID == nil)
         return Button {
-            store.loadConversation(meta.id)
-            dismiss()
+            open(meta)
         } label: {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
@@ -146,10 +248,13 @@ struct HistoryPopover: View {
                         .lineLimit(1)
                 }
             }
-            .padding(.vertical, 7)
             .padding(.horizontal, 8)
+            // Fixed height, not padding: the popover's total height is computed
+            // from these before it is presented (5c).
+            .frame(height: rowHeight(meta), alignment: .leading)
             .background(
-                isCurrent ? Theme.color(accentHex).opacity(0.16)
+                isPressed ? Theme.color(accentHex).opacity(0.34)
+                    : isCurrent ? Theme.color(accentHex).opacity(0.16)
                     : isHovered || isSelected ? Color.primary.opacity(0.06)
                     : .clear,
                 in: RoundedRectangle(cornerRadius: 9, style: .continuous)
@@ -175,7 +280,7 @@ struct HistoryPopover: View {
         }
     }
 
-    // MARK: - Grouping
+    // MARK: - Grouping & geometry
 
     private var filtered: [ConversationMeta] {
         guard !filter.isEmpty else { return store.recent }
@@ -185,25 +290,58 @@ struct HistoryPopover: View {
         }
     }
 
-    private struct DayGroup: Identifiable {
-        let id: String
-        let title: String
-        var items: [ConversationMeta]
+    /// What actually renders — the render cap applies here so keyboard selection
+    /// can never land on a row that isn't on screen.
+    private var visible: [ConversationMeta] {
+        Array(filtered.prefix(Metrics.renderCap))
     }
 
-    private var groups: [DayGroup] {
-        let calendar = Calendar.current
-        var result: [DayGroup] = []
-        for meta in filtered {
-            let day = calendar.startOfDay(for: meta.updatedAt)
-            let key = day.formatted(.iso8601.year().month().day())
-            if result.last?.id == key {
-                result[result.count - 1].items.append(meta)
-            } else {
-                result.append(DayGroup(id: key, title: groupTitle(for: meta.updatedAt, calendar: calendar), items: [meta]))
+    /// Day headers and rows flattened into one list, so the height math is a sum.
+    private enum ListItem {
+        case header(String, key: String)
+        case chat(ConversationMeta)
+
+        var id: String {
+            switch self {
+            case let .header(_, key): "h:\(key)"
+            case let .chat(meta): "c:\(meta.id.uuidString)"
             }
         }
+    }
+
+    private var items: [ListItem] {
+        let calendar = Calendar.current
+        var result: [ListItem] = []
+        var lastKey: String?
+        for meta in visible {
+            let day = calendar.startOfDay(for: meta.updatedAt)
+            let key = day.formatted(.iso8601.year().month().day())
+            if key != lastKey {
+                result.append(.header(groupTitle(for: meta.updatedAt, calendar: calendar), key: key))
+                lastKey = key
+            }
+            result.append(.chat(meta))
+        }
         return result
+    }
+
+    private func rowHeight(_ meta: ConversationMeta) -> CGFloat {
+        meta.snippet.isEmpty ? Metrics.rowPlain : Metrics.rowWithSnippet
+    }
+
+    /// The list's presented height: the exact content height, capped. Known
+    /// before the first layout pass, so the popover never resizes after it pops.
+    private var listHeight: CGFloat {
+        let items = items
+        guard !items.isEmpty else { return 0 }
+        let content = items.reduce(0) { total, item in
+            switch item {
+            case .header: total + Metrics.groupHeader
+            case let .chat(meta): total + rowHeight(meta)
+            }
+        }
+        let spacing = Metrics.itemSpacing * CGFloat(items.count - 1)
+        return min(content + spacing + Metrics.listInset * 2, Metrics.maxListHeight)
     }
 
     private func groupTitle(for date: Date, calendar: Calendar) -> String {

@@ -26,6 +26,16 @@ final class ChatStore: ObservableObject {
     @Published private(set) var recent: [ConversationMeta] = []
     private(set) var conversationID = UUID()
 
+    /// Bumped whenever a STORED conversation replaces the current one (history
+    /// pick, launch resume) — as opposed to messages arriving by chat. Drives the
+    /// restore choreography of delta 3 (5d): the panel's slower growth curve and
+    /// the transcript's one-group reveal. Both need to fire before `messages`
+    /// changes, so `adopt` sets them first.
+    @Published private(set) var restoreTick = 0
+    /// Whether that restore landed in an empty panel (which is about to grow) or
+    /// replaced a conversation already on screen (crossfade in place).
+    private(set) var restoredIntoEmptyPanel = false
+
     // Fork state: `messages` always holds the full resolved transcript, but a
     // forked conversation persists only its divergent tail — the first
     // `sharedPrefixCount` messages belong to the parent chain.
@@ -56,6 +66,11 @@ final class ChatStore: ObservableObject {
     }
 
     private func adopt(_ loaded: (conversation: Conversation, messages: [ChatMessage], missingParent: Bool)) {
+        // Announced BEFORE `messages` changes: @Published sends in willSet, so
+        // everything observing the message list already sees the restore flags
+        // when it reacts (PanelController's growth curve, ChatView's reveal).
+        restoredIntoEmptyPanel = messages.isEmpty
+        restoreTick += 1
         conversationID = loaded.conversation.id
         messages = loaded.messages
         if loaded.missingParent {

@@ -25,7 +25,7 @@ struct KeyRoutingTextField: NSViewRepresentable {
     var onEscape: () -> Bool = { false }
 
     func makeNSView(context: Context) -> NSTextField {
-        let field = NSTextField()
+        let field = AutoFocusingTextField()
         field.delegate = context.coordinator
         field.isBordered = false
         field.drawsBackground = false
@@ -35,9 +35,6 @@ struct KeyRoutingTextField: NSViewRepresentable {
         field.stringValue = text
         field.lineBreakMode = .byTruncatingTail
         field.cell?.sendsActionOnEndEditing = false
-        // Both fields appear only on demand (find bar, history popover), so
-        // claiming focus on creation is what the user asked for by opening them.
-        DispatchQueue.main.async { field.window?.makeFirstResponder(field) }
         return field
     }
 
@@ -85,6 +82,30 @@ struct KeyRoutingTextField: NSViewRepresentable {
                 return false
             }
         }
+    }
+}
+
+/// Claims first responder as soon as it is actually in a window (delta 3, 5c).
+/// Both users of this field appear only on demand — the find bar and the history
+/// popover — so focus on appearance is exactly what the user asked for by
+/// opening them.
+///
+/// Two constraints shape this. It must hang off `viewDidMoveToWindow` rather
+/// than `makeNSView`, so it can never fire while `window` is still nil. And it
+/// must NOT call `makeFirstResponder` synchronously from there: installing the
+/// field editor inserts a view, and `viewDidMoveToWindow` runs inside AppKit's
+/// own walk of that subtree — mutating it mid-walk throws
+/// "collection was mutated while being enumerated" out of
+/// NSViewUpdateVibrancyForSubtree. `RunLoop.main.perform` gets out of the walk
+/// while still landing ahead of the next display flush.
+private final class AutoFocusingTextField: NSTextField {
+    private var hasClaimedFocus = false
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard let window, !hasClaimedFocus else { return }
+        hasClaimedFocus = true
+        RunLoop.main.perform(inModes: [.common]) { window.makeFirstResponder(self) }
     }
 }
 

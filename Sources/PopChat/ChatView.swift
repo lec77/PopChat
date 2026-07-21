@@ -44,6 +44,10 @@ struct ChatView: View {
     @State private var findQuery = ""
     @State private var findIndex = 0
     @State private var findFocusBump = 0
+    /// 5d: a restored conversation arrives as ONE group once the panel has begun
+    /// growing — no per-row stagger, this is a restore, not new content. False
+    /// only for the frame or two between the restore and its reveal.
+    @State private var transcriptRevealed = true
     @AppStorage("accentColor") private var accentHex = Theme.defaultAccentHex
     @Environment(\.colorScheme) private var scheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -91,6 +95,22 @@ struct ChatView: View {
             if store.messages.isEmpty, shown {
                 onCompactHeightChange(440)
             }
+        }
+        // Lives on the root, not in transcriptZone: restoring into an EMPTY panel
+        // builds that subtree fresh, and .onChange never fires on first appearance.
+        .onChange(of: store.restoreTick) { _, _ in revealRestoredTranscript() }
+    }
+
+    /// Hide, let one layout pass land (that's where the transcript pre-scrolls to
+    /// the bottom), then bring it in as a group ~60ms into the panel's growth so
+    /// text never pops in mid-resize.
+    private func revealRestoredTranscript() {
+        let intoEmptyPanel = store.restoredIntoEmptyPanel
+        transcriptRevealed = false
+        let delay = reduceMotion || !intoEmptyPanel ? 0.016 : 0.06
+        let reveal = reduceMotion || !intoEmptyPanel ? 0.15 : 0.2
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            withAnimation(.easeOut(duration: reveal)) { transcriptRevealed = true }
         }
     }
 
@@ -321,6 +341,10 @@ struct ChatView: View {
                     .padding(.top, 56)
                     .padding(.horizontal, 16)
                     .padding(.bottom, 8)
+                    // 5d: the restore reveal. Opacity/offset on the group only —
+                    // it cannot change any row's metrics, so nothing re-measures.
+                    .opacity(transcriptRevealed ? 1 : 0)
+                    .offset(y: transcriptRevealed || reduceMotion ? 0 : 8)
                 }
             )
             .background(
@@ -333,12 +357,17 @@ struct ChatView: View {
             .overlay(alignment: .top) {
                 VStack(spacing: 0) {
                     pillsRow
-                        .padding(12)
+                        .padding(.horizontal, 12)
+                        .padding(.top, 12)
+                        // The bar tucks up under the pills (5a): the row's bottom
+                        // inset drops to 4 while it's open.
+                        .padding(.bottom, findShown ? 4 : 12)
                         .background(WindowDragStrip())
                     if findShown {
                         findBar(matchCount: hits.count)
                             .padding(.horizontal, 12)
-                            .padding(.bottom, 8)
+                            .padding(.top, 6)
+                            .padding(.bottom, 2)
                             .transition(.opacity)
                     }
                 }
@@ -384,6 +413,14 @@ struct ChatView: View {
             }
             .onChange(of: pinnedToBottom) { _, pinned in
                 if pinned { showNewMessagesPill = false }
+            }
+            // Pre-scroll a restored transcript to the bottom while it is still
+            // invisible, so the reveal shows the end of the conversation with no
+            // visible scroll jump (5d). onAppear covers the empty→loaded case
+            // (this subtree is new); onChange covers replacing an open chat.
+            .onAppear { proxy.scrollTo("bottom", anchor: .bottom) }
+            .onChange(of: store.restoreTick) { _, _ in
+                proxy.scrollTo("bottom", anchor: .bottom)
             }
         }
     }
@@ -482,7 +519,8 @@ struct ChatView: View {
                     .contentShape(Circle())
             }
             .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
+            // Dimmer than the steppers (5a): stepping is the bar's job, ✕ isn't.
+            .foregroundStyle(.secondary.opacity(0.78))
             .help("Close find (⎋)")
         }
         .padding(.horizontal, 10)
