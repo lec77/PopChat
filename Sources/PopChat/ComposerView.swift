@@ -71,6 +71,31 @@ final class ComposerModel: ObservableObject {
     }
 }
 
+/// NSTextView that reports input-method composition changes.
+///
+/// While an IME is composing (pinyin, kana, hangul, and any candidate-window
+/// input), the in-progress text is MARKED text: uncommitted, owned by the input
+/// context, and — crucially — it does NOT post `textDidChange`. So the SwiftUI
+/// binding would sit stale for the whole composition, and the next unrelated
+/// re-render (a streaming token, an attachment chip) would see string != binding
+/// and "restore" the binding's value, destroying the composition mid-word. These
+/// overrides keep the binding in step; `updateNSView` additionally refuses to
+/// write while marked text exists. Both halves are needed: this one keeps the
+/// placeholder and height right, that one is the actual safety net.
+final class ComposingTextView: NSTextView {
+    var onCompositionChange: (() -> Void)?
+
+    override func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+        super.setMarkedText(string, selectedRange: selectedRange, replacementRange: replacementRange)
+        onCompositionChange?()
+    }
+
+    override func unmarkText() {
+        super.unmarkText()
+        onCompositionChange?()
+    }
+}
+
 /// AppKit-backed multiline input: grows with content up to `maxVisibleLines`,
 /// then scrolls internally so the caret always stays visible. A stable layout
 /// boundary — the height callback fires only when the measured height actually
@@ -92,7 +117,10 @@ struct ComposerTextView: NSViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let textView = NSTextView()
+        let textView = ComposingTextView()
+        textView.onCompositionChange = { [weak coordinator = context.coordinator] in
+            coordinator?.syncFromTextView()
+        }
         textView.font = .systemFont(ofSize: 13)
         textView.textColor = .labelColor
         textView.drawsBackground = false
@@ -129,7 +157,12 @@ struct ComposerTextView: NSViewRepresentable {
         let coordinator = context.coordinator
         coordinator.parent = self
         guard let textView = coordinator.textView else { return }
-        if textView.string != text {
+        // Never write to the text view mid-composition: assigning `string` clears
+        // the input context's marked text and aborts the IME session, so any
+        // re-render arriving while the user was composing (streaming tokens do it
+        // ~30×/s) made Chinese/Japanese/Korean input impossible. The binding is
+        // kept in step by ComposingTextView, and resyncs on commit either way.
+        if !textView.hasMarkedText(), textView.string != text {
             textView.string = text
             coordinator.remeasure()
         }
@@ -184,6 +217,14 @@ struct ComposerTextView: NSViewRepresentable {
         }
 
         func textDidChange(_ notification: Notification) {
+            syncFromTextView()
+        }
+
+        /// Push the view's text into the binding. Also called for marked-text
+        /// changes, which post no textDidChange of their own — without it the
+        /// placeholder stays visible under an in-progress composition and the
+        /// field doesn't grow as it gets longer.
+        func syncFromTextView() {
             guard let textView else { return }
             parent.text = textView.string
             remeasure()

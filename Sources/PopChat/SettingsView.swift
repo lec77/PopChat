@@ -157,7 +157,7 @@ struct SettingsView: View {
             } header: {
                 Text("Chat Style")
             } footer: {
-                Text("Applies to your messages in the panel. Defaults: Accent tint, Blue, Per-character streaming. Panel tint defaults to the system glass appearance; the slider overrides it for PopChat only. Reduce Transparency always wins.")
+                Text("Applies to your messages in the panel. Streaming text: Per-character fades in glyph by glyph, Per-sentence commits a sentence at a time. Defaults: Accent tint, Blue, Per-character streaming. Panel tint defaults to the system glass appearance; the slider overrides it for PopChat only. Reduce Transparency always wins.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

@@ -22,13 +22,17 @@ enum BubbleStyle: String, CaseIterable, Identifiable {
 
 enum StreamingMode: String, CaseIterable, Identifiable {
     case perCharacter
-    case byChunk
+    /// Delta 4 renamed "By chunk" → "Per-sentence" (mirroring raw snapshots
+    /// mid-word read as the same stutter as per-character did). The RAW VALUE
+    /// deliberately stays "byChunk" so saved prefs migrate silently — this is
+    /// the whole migration; there is no other decode path.
+    case perSentence = "byChunk"
 
     var id: String { rawValue }
     var label: String {
         switch self {
         case .perCharacter: "Per-character"
-        case .byChunk: "By chunk"
+        case .perSentence: "Per-sentence"
         }
     }
 }

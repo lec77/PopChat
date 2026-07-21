@@ -47,13 +47,29 @@ final class ChatStore: ObservableObject {
     private let shortcutStore: ShortcutStore
     private var streamTask: Task<Void, Never>?
 
-    // Per-character streaming: partial snapshots land in `streamTarget`; a drain
-    // task reveals them at ~180 chars/s (accelerating when it falls behind, so the
-    // display never lags the stream noticeably). Stop flushes instantly.
+    // Streaming reveal: partial snapshots land in `streamTarget`; a drain task
+    // reveals them — per-character at a paced ~180 chars/s, per-sentence at
+    // boundaries. The per-character pacing MUST be allowed to lag behind arrival
+    // — see startDrain — or it is indistinguishable from mirroring the stream.
+    // Stop flushes instantly.
     private var streamTarget = ""
+    /// How much of the reply has ARRIVED, vs. how much of it the typewriter has
+    /// revealed — `--smoke-input --live` compares the two to prove the composer is
+    /// released mid-reveal rather than at the end of it.
+    var streamTargetLength: Int { streamTarget.count }
     private var streamFinished = false
     private var streamingMessageID: UUID?
     private var drainTask: Task<Void, Never>?
+
+    /// Delta 4: the trailing fade over text the drain has just committed, for the
+    /// row currently revealing. Published so the streaming row repaints while the
+    /// fade runs out even on ticks where no new characters landed — MessageRow is
+    /// Equatable-gated on it, so no other row is touched.
+    struct RevealState: Equatable {
+        var messageID: UUID
+        var fade: TextReveal
+    }
+    @Published private(set) var reveal: RevealState?
 
     init(providerStore: ProviderStore, shortcutStore: ShortcutStore) {
         self.providerStore = providerStore
@@ -123,6 +139,9 @@ final class ChatStore: ObservableObject {
     func send(_ text: String, attachments: [Attachment] = []) {
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || !attachments.isEmpty, !isStreaming else { return }
+        // A previous reply may still be typing itself out; complete it instantly
+        // rather than letting the new turn's rows appear above a half-revealed one.
+        flushTypewriter()
 
         // Slash-command expansion: display stays compact, the template goes on the wire.
         var wireText: String?
@@ -217,11 +236,7 @@ final class ChatStore: ObservableObject {
                 switch event {
                 case .partial(let text), .done(let text):
                     streamTarget = text
-                    if typewriter == .perCharacter {
-                        startDrain(messageID: assistantMessage.id)
-                    } else {
-                        messages[assistantIndex].text = text
-                    }
+                    startDrain(messageID: assistantMessage.id, mode: typewriter)
                 case .activity(let text):
                     messages.insert(ChatMessage(role: .activity, text: text), at: assistantIndex)
                     assistantIndex += 1
@@ -229,46 +244,218 @@ final class ChatStore: ObservableObject {
                     messages.append(ChatMessage(role: .error, text: message))
                 }
             }
+            let finalText = streamTarget
             streamFinished = true
+            // Hand the composer back the moment the NETWORK turn ends. The
+            // typewriter can still be revealing seconds of tail (typewriterStep
+            // deliberately lags), and holding isStreaming across it left the send
+            // button stuck as Stop and Return doing nothing long after the reply
+            // had actually arrived.
+            isStreaming = false
             await drainTask?.value
-            drainTask = nil
-            if messages.indices.contains(assistantIndex), messages[assistantIndex].role == .assistant {
-                if streamTarget.isEmpty {
-                    messages.remove(at: assistantIndex)
+            // "Still ours": flushTypewriter() clears streamingMessageID when a new
+            // turn takes over mid-reveal, so this must not clobber its bookkeeping.
+            let stillOurs = streamingMessageID == assistantMessage.id
+            // The drain has returned by now, so any fade it left is stale — it
+            // exits without clearing when the row it was revealing is gone.
+            if stillOurs { drainTask = nil; reveal = nil }
+            // By id, not by index, and with the text captured above: the user can
+            // now start another turn while this tail reveals, so neither the row
+            // nor `streamTarget` is guaranteed to still be ours.
+            if let index = messages.firstIndex(where: { $0.id == assistantMessage.id }) {
+                if finalText.isEmpty {
+                    messages.remove(at: index)
                 } else {
-                    messages[assistantIndex].text = streamTarget
+                    messages[index].text = finalText
                 }
             }
-            streamingMessageID = nil
-            isStreaming = false
+            if stillOurs { streamingMessageID = nil }
             persist()
         }
     }
 
-    private func startDrain(messageID: UUID) {
+    /// Typewriter reveal speed. The per-tick step is this divided by the tick rate,
+    /// so the granularity floor is a perf consequence (~6 chars at 33ms), not a
+    /// choice: every tick re-lays out the growing message.
+    nonisolated private static let typewriterCharsPerSecond = 180
+
+    /// Tick period. Each tick re-renders and re-lays-out the growing message, and
+    /// that cost scales with its length — so long texts tick less often (and take
+    /// proportionally bigger steps to hold the same feel).
+    nonisolated static func typewriterInterval(forLength count: Int) -> Int {
+        count > 12_000 ? 100 : count > 4_000 ? 66 : 33
+    }
+
+    /// Characters to reveal on one tick.
+    ///
+    /// Pace at a FIXED rate while the answer is still arriving, and let the backlog
+    /// grow. Any catch-up term proportional to the backlog settles at an equilibrium
+    /// where the reveal rate EQUALS the arrival rate — which is why this mode used to
+    /// look exactly like `.byChunk` on a fast model. Lag is the only lever that keeps
+    /// the typewriter feel. It stays bounded two ways: the rate floors at "drain the
+    /// backlog in 6s" (so a 20k-char answer isn't a two-minute wait), and it triples
+    /// once the stream is done, so the tail types out instead of stranding the user.
+    /// Extracted from the drain so `--smoke-typewriter` can assert all of that.
+    nonisolated static func typewriterStep(backlog: Int, interval: Int, finished: Bool) -> Int {
+        var rate = max(typewriterCharsPerSecond, backlog / 6)
+        if finished { rate *= 3 }
+        return min(backlog, max(1, rate * interval / 1000))
+    }
+
+    /// Generations of the current step that the per-character fade spans (6a).
+    nonisolated static let revealGenerations = 6
+
+    /// 6b pacing. A commit every ≥140 ms so a fast model can't dump the whole
+    /// answer at once; 60 ms once the stream is done so the tail drains.
+    nonisolated static let sentenceGapMs = 140
+    nonisolated static let sentenceTailGapMs = 60
+    /// How long one committed group takes to fade in (6b).
+    nonisolated static let sentenceFadeMs = 350
+    /// Past this much backlog, per-sentence commits whole paragraphs rather than
+    /// accelerating — the entrance must never speed up (a faster fade reads as
+    /// flicker, not as speed).
+    nonisolated static let sentenceParagraphBacklog = 1_500
+
+    private func startDrain(messageID: UUID, mode: StreamingMode) {
         guard drainTask == nil else { return }
         drainTask = Task { [weak self] in
+            // 6a state: characters currently under the ramp, and the step that
+            // built it (which is also the rate the ramp runs out at).
+            var head = 0
+            var lastStep = 0
+            // 6b state: in-flight sentence groups, newest first, with their age
+            // in ms; plus time since the last commit.
+            var groups: [(length: Int, age: Int)] = []
+            var sinceCommit = Int.max
+
             while let self, !Task.isCancelled {
                 guard let index = self.messages.firstIndex(where: { $0.id == messageID }) else { return }
                 let displayed = self.messages[index].text
                 let target = self.streamTarget
-                // Each tick re-renders and re-lays-out the growing message, and
-                // that cost scales with its length — so the tick rate adapts:
-                // fewer, larger steps for long texts, same ~180 chars/s feel.
-                let interval = target.count > 12_000 ? 100 : target.count > 4_000 ? 66 : 33
-                if displayed.count >= target.count {
-                    if self.streamFinished { return }
-                } else if target.hasPrefix(displayed) {
-                    let backlog = target.count - displayed.count
-                    let step = min(backlog, max(Int(Double(interval) * 0.18), backlog / 12))
-                    self.messages[index].text = String(target.prefix(displayed.count + step))
-                } else {
-                    // Non-monotonic snapshot (new tool round) — jump to it.
+                let interval = Self.typewriterInterval(forLength: target.count)
+                let finished = self.streamFinished
+
+                if !target.hasPrefix(displayed) {
+                    // Non-monotonic snapshot (new tool round) — jump to it, and
+                    // drop any fade: the text it described no longer exists.
                     self.messages[index].text = target
+                    head = 0
+                    groups = []
+                } else if displayed.count >= target.count {
+                    // Nothing to commit: either the stream is done or we are
+                    // waiting on the network. Either way the fade must keep
+                    // running out, or the head would stay dimmed indefinitely.
+                    head = max(0, head - max(lastStep, 1))
+                    if head == 0, groups.isEmpty, finished {
+                        self.reveal = nil
+                        return
+                    }
+                } else if mode == .perCharacter {
+                    let step = Self.typewriterStep(
+                        backlog: target.count - displayed.count,
+                        interval: interval,
+                        finished: finished
+                    )
+                    self.messages[index].text = String(target.prefix(displayed.count + step))
+                    lastStep = step
+                    head = min(displayed.count + step, step * Self.revealGenerations)
+                } else if sinceCommit >= (finished ? Self.sentenceTailGapMs : Self.sentenceGapMs) {
+                    let commit = Self.sentenceCommitLength(
+                        in: target, revealed: displayed.count, finished: finished
+                    )
+                    if commit > displayed.count {
+                        self.messages[index].text = String(target.prefix(commit))
+                        groups.insert((length: commit - displayed.count, age: 0), at: 0)
+                        sinceCommit = 0
+                    }
+                }
+
+                if mode == .perSentence {
+                    for i in groups.indices { groups[i].age += interval }
+                    groups.removeAll { $0.age >= Self.sentenceFadeMs }
+                    sinceCommit = sinceCommit >= Int.max - interval ? Int.max : sinceCommit + interval
+                    self.reveal = groups.isEmpty
+                        ? nil
+                        : RevealState(messageID: messageID, fade: .groups(groups, duration: Self.sentenceFadeMs))
+                } else {
+                    self.reveal = head > 0
+                        ? RevealState(messageID: messageID, fade: .ramp(head: head))
+                        : nil
                 }
                 try? await Task.sleep(for: .milliseconds(interval))
             }
         }
+    }
+
+    /// 6b. Character index the per-sentence reveal may commit up to — the end of
+    /// a sentence, line, or paragraph — or `revealed` when the text has not
+    /// reached a boundary yet, so a half-sentence never shows.
+    ///
+    /// Boundaries: `.` `!` `?` followed by whitespace, and any newline (which is
+    /// what makes list items and closing code fences boundaries too). Positions
+    /// inside an OPEN code fence are never boundaries — a half-written fence must
+    /// not commit. Extracted from the drain so `--smoke-typewriter` can assert it.
+    nonisolated static func sentenceCommitLength(in text: String, revealed: Int, finished: Bool) -> Int {
+        let chars = Array(text)
+        guard revealed < chars.count else { return revealed }
+
+        var boundaries: [Int] = []
+        var paragraphEnds: Set<Int> = []
+        var insideFence = false
+        var atLineStart = true
+        var index = 0
+        while index < chars.count {
+            if atLineStart, chars[index...].starts(with: ["`", "`", "`"]) {
+                insideFence.toggle()
+            }
+            atLineStart = false
+            let char = chars[index]
+            if char == "\n" {
+                atLineStart = true
+                // The newline ENDING a fence line is a boundary when that line
+                // closed the fence (insideFence is already false by then).
+                if !insideFence {
+                    boundaries.append(index + 1)
+                    if index + 1 < chars.count, chars[index + 1] == "\n" {
+                        paragraphEnds.insert(index + 1)
+                    } else if index + 1 == chars.count {
+                        paragraphEnds.insert(index + 1)
+                    }
+                }
+            } else if !insideFence, char == "." || char == "!" || char == "?" {
+                let next = index + 1
+                if next == chars.count {
+                    if finished { boundaries.append(next) }
+                } else if chars[next].isWhitespace {
+                    boundaries.append(next)
+                }
+            }
+            index += 1
+        }
+        // Once the stream is over, the end of the text is ALWAYS a boundary —
+        // including inside a fence the reply never closed. "An unclosed fence
+        // never half-commits" is a rule about mid-stream text, and applying it
+        // here instead strands the drain: it would spin without ever committing,
+        // and the streamTask tail awaits that drain.
+        if finished, boundaries.last != chars.count {
+            boundaries.append(chars.count)
+            paragraphEnds.insert(chars.count)
+        }
+
+        let pending = boundaries.filter { $0 > revealed }
+        guard let last = pending.last else { return revealed }
+
+        // Long answers coalesce instead of accelerating: the same 6 s ceiling as
+        // per-character, spent on MORE PER BEAT rather than a faster entrance.
+        let backlog = chars.count - revealed
+        if backlog > sentenceParagraphBacklog {
+            return pending.last { paragraphEnds.contains($0) } ?? last
+        }
+        let beats = max(1, 6_000 / sentenceGapMs)
+        let perBeat = max(1, Int((Double(pending.count) / Double(beats)).rounded(.up)))
+        let candidate = pending[min(perBeat, pending.count) - 1]
+        // Groups never span a paragraph break — units stay semantic.
+        return pending.first { paragraphEnds.contains($0) && $0 < candidate } ?? candidate
     }
 
     /// Inlines text attachments ahead of the typed text; images become content parts.
@@ -336,12 +523,32 @@ final class ChatStore: ObservableObject {
 
     func stop() {
         streamTask?.cancel()
+        flushTypewriter()
+    }
+
+    /// The complete text of a message: for the row a typewriter is still
+    /// revealing, everything that has ARRIVED rather than the characters typed
+    /// out so far. Copy would otherwise hand back a truncated reply while
+    /// claiming to copy the whole response.
+    func fullText(of messageID: UUID) -> String {
+        if messageID == streamingMessageID, !streamTarget.isEmpty { return streamTarget }
+        return messages.first { $0.id == messageID }?.text ?? ""
+    }
+
+    /// Ends any typewriter still revealing a reply, showing it in full. Called by
+    /// stop() and at the head of send(): once the composer is usable again during
+    /// the reveal (see the streamTask tail), a new turn can begin mid-tail, and it
+    /// must not inherit the previous one's drain or `streamTarget`.
+    private func flushTypewriter() {
         drainTask?.cancel()
         drainTask = nil
-        // Flush the typewriter buffer so everything received is visible at once.
+        // The fade describes a reveal that is over; leaving it would strand the
+        // flushed tail translucent with nothing left to tick it back to opaque.
+        reveal = nil
         if let id = streamingMessageID, let index = messages.firstIndex(where: { $0.id == id }) {
             messages[index].text = streamTarget
         }
+        streamingMessageID = nil
     }
 
     /// Start a new conversation that shares history up to and including
@@ -350,6 +557,12 @@ final class ChatStore: ObservableObject {
     func fork(at messageID: UUID) {
         guard !isStreaming else { return }
         guard let index = messages.firstIndex(where: { $0.id == messageID }) else { return }
+        // A reply can still be typing itself out here (isStreaming tracks the
+        // network turn, not the reveal). Complete it FIRST: the persist() below
+        // writes the parent, and everything after re-points the store at the
+        // branch — so a partial row would be frozen into the parent's file and
+        // never corrected, truncating the reply permanently.
+        flushTypewriter()
         persist() // parent must be current on disk before the branch points into it
         forkParentID = conversationID
         forkMessageID = messageID

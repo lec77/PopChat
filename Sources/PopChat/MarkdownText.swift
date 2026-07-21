@@ -513,6 +513,11 @@ struct SelectableText: NSViewRepresentable {
     /// keying on the UNPAINTED `attributed` and typing in the find field never
     /// re-measures the transcript.
     var find: TextFind?
+    /// Delta 4 streaming fade for THIS view's text. Like `find`, it only
+    /// multiplies alpha into `.foregroundColor` — metrics-neutral, so
+    /// `sizeThatFits` keeps keying on the UNPAINTED `attributed` and a fade tick
+    /// never re-measures the transcript.
+    var reveal: TextReveal?
 
     /// Number of actual CoreText measurements performed (cache misses).
     /// Read by the --smoke-typing harness; main-thread only.
@@ -535,8 +540,10 @@ struct SelectableText: NSViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     private var displayed: NSAttributedString {
-        guard let find else { return attributed }
-        return FindHighlight.paint(attributed, find: find)
+        var result = attributed
+        if let find { result = FindHighlight.paint(result, find: find) }
+        if let reveal { result = RevealFade.paint(result, reveal: reveal) }
+        return result
     }
 
     func makeNSView(context: Context) -> NSTextField {
@@ -655,6 +662,9 @@ struct AssistantMessageView: View {
     let text: String
     var showCaret = false
     var find: MessageFind?
+    /// Delta 4: the fade over just-revealed text. It lands on the LAST segment —
+    /// the only one the drain can be appending to.
+    var reveal: TextReveal?
 
     @AppStorage("accentColor") private var accentHex = Theme.defaultAccentHex
 
@@ -664,20 +674,28 @@ struct AssistantMessageView: View {
         VStack(alignment: .leading, spacing: 8) {
             ForEach(Array(segments.enumerated()), id: \.offset) { index, segment in
                 let segmentFind = finds[index].first ?? nil
+                let last = index == segments.count - 1
                 switch segment {
                 case .prose(let prose):
                     // While streaming, the last prose segment carries a steady
                     // (non-blinking) inline caret — a timer-driven blink here would
                     // re-evaluate and re-layout the transcript on every tick.
+                    let caret = showCaret && last
                     SelectableText(
                         attributed: MarkdownRenderer.attributedProse(
                             prose,
-                            caret: showCaret && index == segments.count - 1 ? Theme.nsColor(accentHex) : nil
+                            caret: caret ? Theme.nsColor(accentHex) : nil
                         ),
-                        find: segmentFind
+                        find: segmentFind,
+                        // The caret glyph rides the HEAD of the fade rather than
+                        // being part of it, so it stays solid.
+                        reveal: last ? reveal.map { fade(over: prose, $0, caret: caret ? 1 : 0) } : nil
                     )
                 case .code(let language, let content):
-                    CodeBlockView(language: language, content: content, find: segmentFind)
+                    CodeBlockView(
+                        language: language, content: content, find: segmentFind,
+                        reveal: last ? reveal.map { fade(over: content, $0, caret: 0) } : nil
+                    )
                 case .quote(let quote):
                     QuoteBlockView(text: quote, find: segmentFind)
                 case .table(let header, let rows):
@@ -692,6 +710,24 @@ struct AssistantMessageView: View {
                 BlinkingCaret(color: Theme.color(accentHex))
             }
         }
+    }
+
+    /// Fits the drain's fade onto one segment. The stop lengths are counted in
+    /// SOURCE characters while the painted string is RENDERED text (markdown
+    /// syntax stripped, inline math swapped for attachments), so the head can sit
+    /// a few characters off — invisible in a soft tail gradient. Clamping is not
+    /// optional though: a head longer than this segment would otherwise bleed the
+    /// ramp back across text that settled long ago.
+    private func fade(over source: String, _ reveal: TextReveal, caret: Int) -> TextReveal {
+        var budget = source.count
+        var stops: [TextReveal.Stop] = []
+        for stop in reveal.stops {
+            guard budget > 0 else { break }
+            let length = min(stop.length, budget)
+            stops.append(TextReveal.Stop(length: length, alpha: stop.alpha))
+            budget -= length
+        }
+        return TextReveal(stops: stops, trailingSkip: caret)
     }
 
     /// One highlight context per text view, walked in the same order
@@ -728,6 +764,7 @@ struct CodeBlockView: View {
     let language: String?
     let content: String
     var find: TextFind?
+    var reveal: TextReveal?
 
     @State private var copied = false
     @Environment(\.colorScheme) private var scheme
@@ -761,8 +798,11 @@ struct CodeBlockView: View {
             .padding(.vertical, 5)
             .background(Theme.recessedHeader(dark: dark))
             ScrollView(.horizontal, showsIndicators: false) {
-                SelectableText(attributed: MarkdownRenderer.highlightedCode(content, dark: dark), wraps: false, find: find)
-                    .padding(10)
+                SelectableText(
+                    attributed: MarkdownRenderer.highlightedCode(content, dark: dark),
+                    wraps: false, find: find, reveal: reveal
+                )
+                .padding(10)
             }
         }
         .background(Theme.recessedFill(dark: dark))

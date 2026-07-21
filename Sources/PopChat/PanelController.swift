@@ -23,6 +23,7 @@ final class PanelController: NSObject, NSWindowDelegate {
     private static let compactMinHeight: CGFloat = 120
     private static let expandedMinHeight: CGFloat = 320
     private static let defaultExpandedHeight: CGFloat = 440
+    private static let defaultWidth: CGFloat = 580
 
     /// User's preferred height for the expanded (has messages) state. Clamped on
     /// read: values below the minimum may persist from before minimums were
@@ -33,6 +34,18 @@ final class PanelController: NSObject, NSWindowDelegate {
             return stored > 0 ? max(stored, Self.expandedMinHeight) : Self.defaultExpandedHeight
         }
         set { UserDefaults.standard.set(newValue, forKey: "panelExpandedHeight") }
+    }
+
+    /// User's preferred width, remembered the same way the expanded height is —
+    /// the panel used to launch at a hardcoded width every time, so any width the
+    /// user dragged to was silently lost on quit. Unlike the height there is only
+    /// one value: width doesn't change between the compact and expanded states.
+    private var panelWidth: CGFloat {
+        get {
+            let stored = UserDefaults.standard.double(forKey: "panelWidth")
+            return stored > 0 ? max(stored, Self.minWidth) : Self.defaultWidth
+        }
+        set { UserDefaults.standard.set(newValue, forKey: "panelWidth") }
     }
 
     /// The live minimum content size — 520×320 with messages, 520×120 empty (4a).
@@ -62,7 +75,7 @@ final class PanelController: NSObject, NSWindowDelegate {
     }
 
     private lazy var panel: FloatingPanel = {
-        let panel = FloatingPanel(contentRect: NSRect(x: 0, y: 0, width: 680, height: Self.defaultExpandedHeight))
+        let panel = FloatingPanel(contentRect: NSRect(x: 0, y: 0, width: panelWidth, height: expandedHeight))
         // Minimum size is enforced in windowWillResize, NOT via contentMinSize:
         // NSHostingView (even with sizingOptions = []) clears the window's
         // min/max constraints to zero during layout, so contentMinSize writes
@@ -231,15 +244,17 @@ final class PanelController: NSObject, NSWindowDelegate {
     /// the cursor is on (user decision 2026-07-21 — overrides the design doc's
     /// upper-center placement).
     private func position() {
-        let size = panel.frame.size
         if let topLeft = savedTopLeft {
+            let size = panel.frame.size
             let frame = NSRect(x: topLeft.x, y: topLeft.y - size.height, width: size.width, height: size.height)
-            let onScreen = NSScreen.screens.contains { screen in
+            let host = NSScreen.screens.first { screen in
                 let intersection = frame.intersection(screen.visibleFrame)
                 return intersection.width >= 120 && intersection.height >= 80
             }
-            if onScreen {
-                panel.setFrameOrigin(frame.origin)
+            if let host {
+                // Clamp first: it can shrink the panel, which moves the bottom edge.
+                shrinkToFit(host)
+                panel.setFrameOrigin(NSPoint(x: topLeft.x, y: topLeft.y - panel.frame.height))
                 return
             }
         }
@@ -247,12 +262,38 @@ final class PanelController: NSObject, NSWindowDelegate {
         let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) }
             ?? NSScreen.main
             ?? NSScreen.screens[0]
+        shrinkToFit(screen)
         let visible = screen.visibleFrame
+        let size = panel.frame.size
         let origin = NSPoint(
             x: visible.midX - size.width / 2,
             y: visible.minY + visible.height * 0.45 - size.height / 2
         )
         panel.setFrameOrigin(origin)
+    }
+
+    /// Keeps the panel no bigger than the screen it opens on. Persisted sizes
+    /// outlive the display they were chosen on (`panelWidth`/`panelExpandedHeight`
+    /// are clamped only at the LOW end), and position() is satisfied by a 120×80
+    /// intersection, so nothing here would shrink an oversized restore.
+    ///
+    /// DEFENCE IN DEPTH, not a load-bearing fix: AppKit already applies
+    /// constrainFrameRect(toScreen:) to this .titled panel, and `--smoke-minsize`
+    /// confirms a 9000×9000 restore comes back at screen width with this method
+    /// commented out. It exists so the invariant survives a style-mask change —
+    /// borderless windows are NOT constrained. Applied in memory only: the stored
+    /// size is left alone so it returns intact on the big display.
+    private func shrinkToFit(_ screen: NSScreen) {
+        let visible = screen.visibleFrame
+        let minFrame = panel.frameRect(forContentRect: NSRect(origin: .zero, size: minContentSize)).size
+        let frame = panel.frame
+        let width = max(min(frame.width, visible.width), minFrame.width)
+        let height = max(min(frame.height, visible.height), minFrame.height)
+        guard width < frame.width - 0.5 || height < frame.height - 0.5 else { return }
+        panel.setFrame(
+            NSRect(x: frame.origin.x, y: frame.maxY - height, width: width, height: height),
+            display: false
+        )
     }
 
     // MARK: - Dynamic height (compact ↔ expanded)
@@ -356,8 +397,12 @@ final class PanelController: NSObject, NSWindowDelegate {
     }
 
     func windowDidEndLiveResize(_ notification: Notification) {
+        let content = panel.contentRect(forFrameRect: panel.frame)
+        // Width persists from either state; the height only means something when
+        // there are messages (the compact height is content-driven, not chosen).
+        panelWidth = content.width
         if !chatStore.messages.isEmpty {
-            expandedHeight = panel.contentRect(forFrameRect: panel.frame).height
+            expandedHeight = content.height
         }
     }
 }

@@ -40,7 +40,15 @@ struct KeyRoutingTextField: NSViewRepresentable {
 
     func updateNSView(_ field: NSTextField, context: Context) {
         context.coordinator.parent = self
-        if field.stringValue != text { field.stringValue = text }
+        // Never replace the value while an input method is composing: assigning
+        // stringValue tears down the field editor's marked text and aborts the
+        // session, so any re-render underneath (a streaming token repainting the
+        // transcript) would kill a Chinese/Japanese/Korean search mid-word.
+        // Unlike the composer, marked text is deliberately NOT pushed into the
+        // binding here — searching on uncommitted pinyin would just report 0
+        // matches; controlTextDidChange syncs it when the composition commits.
+        let composing = (field.currentEditor() as? NSTextView)?.hasMarkedText() ?? false
+        if !composing, field.stringValue != text { field.stringValue = text }
         if field.placeholderString != placeholder { field.placeholderString = placeholder }
         if context.coordinator.lastFocusBump != focusBump {
             context.coordinator.lastFocusBump = focusBump

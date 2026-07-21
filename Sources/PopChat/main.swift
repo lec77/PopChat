@@ -62,6 +62,192 @@ if smokePlain || smokeSearch || smokePasteable {
     RunLoop.main.run()
 }
 
+// Typewriter pacing (no network, no UI): replays the drain's step law against a
+// synthetic fast provider. Guards the invariant that regressed once — while the
+// answer is still arriving the reveal must run at a fixed rate and FALL BEHIND;
+// a backlog-proportional step settles at reveal-rate == arrival-rate, which made
+// "Per-character" render identically to "By chunk".
+if CommandLine.arguments.contains("--smoke-typewriter") {
+    // (total chars, provider chars/sec, max seconds the reveal may trail arrival)
+    let cases: [(total: Int, arrival: Double, slack: Double)] = [
+        (600, 900, 8), (3_000, 900, 10), (20_000, 1_500, 12),
+    ]
+    var failures: [String] = []
+    for probe in cases {
+        let arrivalMs = Int(Double(probe.total) / probe.arrival * 1000)
+        var revealed = 0, elapsed = 0, revealedAtArrival = -1
+        while revealed < probe.total, elapsed < 300_000 {
+            if revealedAtArrival < 0, elapsed >= arrivalMs { revealedAtArrival = revealed }
+            let arrived = min(probe.total, Int(probe.arrival * Double(elapsed) / 1000))
+            let backlog = arrived - revealed
+            if backlog > 0 {
+                revealed += ChatStore.typewriterStep(
+                    backlog: backlog,
+                    interval: ChatStore.typewriterInterval(forLength: arrived),
+                    finished: elapsed >= arrivalMs
+                )
+            }
+            elapsed += ChatStore.typewriterInterval(forLength: arrived)
+        }
+        if revealedAtArrival < 0 { revealedAtArrival = revealed }
+        let trail = Double(elapsed - arrivalMs) / 1000
+        // THE assertion: how fast text appeared while the model was still producing.
+        // Not the tail — the old backlog/12 catch-up also kept typing ~1s past the
+        // end, yet during the answer it ran at the provider's rate, which is exactly
+        // what made it look like .byChunk. Anything near the arrival rate is a mirror,
+        // not a typewriter. (A short answer can pass this trivially: it ends before
+        // the lag has room to build. The 3k/20k probes are the ones that discriminate.)
+        let displayRate = Double(revealedAtArrival) / (Double(arrivalMs) / 1000)
+        let paced = displayRate <= probe.arrival * 0.75
+        let bounded = revealed == probe.total && trail <= probe.slack
+        print(String(format: "%6d chars @%.0f/s → arrival %.1fs, reveal %.1fs (trail %.1fs), shown while streaming %.0f chars/s %@",
+                     probe.total, probe.arrival, Double(arrivalMs) / 1000, Double(elapsed) / 1000,
+                     trail, displayRate, paced && bounded ? "ok" : "BAD"))
+        if !paced {
+            failures.append(String(format: "%d: reveal mirrors arrival (%.0f of %.0f chars/s)",
+                                   probe.total, displayRate, probe.arrival))
+        }
+        if !bounded { failures.append("\(probe.total): reveal trails \(trail)s / revealed \(revealed)") }
+    }
+    // Delta 4 / 6b: the per-sentence commit law. Replays the same synthetic
+    // provider through ChatStore.sentenceCommitLength and checks the three things
+    // the mode promises — commits land on sentence boundaries, never inside an
+    // open code fence, and are paced (≥140 ms apart while arriving, ≥60 ms after)
+    // without blowing the 6 s drain ceiling on a long answer.
+    let unit = """
+    Margins held through Q2, but two suppliers now carry most of the risk. Acme and \
+    Delta both feed final assembly, so a stall at either blocks shipments.
+
+    Here is the check:
+
+    ```swift
+    let ratio = 1.5 // note. a period mid-fence, and no boundary may land here
+    print(ratio)
+    ```
+
+    I'd dual-source the top parts before Q3. That is the whole recommendation!
+
+    """
+
+    /// Independent of the implementation: is `index` a legal commit point?
+    func isBoundary(_ chars: [Character], _ index: Int) -> Bool {
+        if index == chars.count { return true }
+        guard index > 0 else { return false }
+        let prev = chars[index - 1]
+        if prev == "\n" { return true }
+        if prev == "." || prev == "!" || prev == "?" { return chars[index].isWhitespace }
+        return false
+    }
+
+    /// Number of ``` fence lines before `index` — odd means the fence is open.
+    func fencesBefore(_ chars: [Character], _ index: Int) -> Int {
+        var count = 0, i = 0, atLineStart = true
+        while i < index {
+            if atLineStart, chars[i...].starts(with: ["`", "`", "`"]) { count += 1 }
+            atLineStart = chars[i] == "\n"
+            i += 1
+        }
+        return count
+    }
+
+    // The third probe ends INSIDE a fence the model never closed: no boundary is
+    // legal there, so the drain must still finish rather than spin — and the
+    // streamTask tail awaits that drain, so spinning would hang the turn.
+    for probe in [(copies: 1, arrival: 900.0, truncated: false),
+                  (copies: 24, arrival: 1_500.0, truncated: false),
+                  (copies: 1, arrival: 900.0, truncated: true)] {
+        var reply = String(repeating: unit, count: probe.copies)
+        if probe.truncated { reply += "```swift\nlet unfinished = " }
+        let chars = Array(reply)
+        let arrivalMs = Int(Double(chars.count) / probe.arrival * 1000)
+        var revealed = 0, elapsed = 0, sinceCommit = Int.max
+        var commits: [(at: Int, gap: Int, finished: Bool)] = []
+        while revealed < chars.count, elapsed < 300_000 {
+            let arrived = min(chars.count, Int(probe.arrival * Double(elapsed) / 1000))
+            let finished = elapsed >= arrivalMs
+            let gap = finished ? ChatStore.sentenceTailGapMs : ChatStore.sentenceGapMs
+            if revealed < arrived, sinceCommit >= gap {
+                let commit = ChatStore.sentenceCommitLength(
+                    in: String(chars.prefix(arrived)), revealed: revealed, finished: finished
+                )
+                if commit > revealed {
+                    commits.append((at: commit, gap: sinceCommit, finished: finished))
+                    revealed = commit
+                    sinceCommit = 0
+                }
+            }
+            let interval = ChatStore.typewriterInterval(forLength: max(arrived, 1))
+            sinceCommit = sinceCommit >= Int.max - interval ? Int.max : sinceCommit + interval
+            elapsed += interval
+        }
+
+        let offBoundary = commits.filter { !isBoundary(chars, $0.at) }
+        // End-of-text is exempt: a finished reply must commit even if the model
+        // left a fence open.
+        let inFence = commits.filter { $0.at < chars.count && fencesBefore(chars, $0.at) % 2 == 1 }
+        // The SPEC's numbers, deliberately literal: the loop above is driven by
+        // ChatStore's constants, so asserting against those same constants would
+        // be tautological — retuning them has to fail here.
+        let tooEager = commits.dropFirst().filter { $0.gap < ($0.finished ? 60 : 140) }
+        let trail = Double(elapsed - arrivalMs) / 1000
+        let ok = offBoundary.isEmpty && inFence.isEmpty && tooEager.isEmpty
+            && revealed == chars.count && trail <= 7
+        print(String(format: "%6d chars @%.0f/s → %d commits, arrival %.1fs, reveal %.1fs (trail %.1fs) %@",
+                     chars.count, probe.arrival, commits.count, Double(arrivalMs) / 1000,
+                     Double(elapsed) / 1000, trail, ok ? "ok" : "BAD"))
+        if let bad = offBoundary.first {
+            let around = String(chars[max(0, bad.at - 12)..<min(chars.count, bad.at + 4)])
+            failures.append("sentence: commit at \(bad.at) is mid-sentence (…\(around.debugDescription))")
+        }
+        if let bad = inFence.first { failures.append("sentence: commit at \(bad.at) is inside an open code fence") }
+        if let bad = tooEager.first { failures.append("sentence: commit only \(bad.gap)ms after the previous one") }
+        if revealed != chars.count { failures.append("sentence: revealed \(revealed)/\(chars.count)") }
+        if trail > 7 { failures.append(String(format: "sentence: reveal trails arrival by %.1fs", trail)) }
+    }
+
+    // Delta 4 / 6a: the fade ramp is a spatial function of the drain's step, so
+    // it must cover the head, stay monotonic towards opaque, and never extend
+    // past what has actually been revealed.
+    let ramp = TextReveal.ramp(head: 48)
+    let covered = ramp.stops.reduce(0) { $0 + $1.length }
+    let monotonic = zip(ramp.stops, ramp.stops.dropFirst()).allSatisfy { $0.alpha < $1.alpha }
+    print("fade ramp: \(ramp.stops.count) bands over \(covered) chars, "
+          + String(format: "alpha %.2f→%.2f %@", ramp.stops.first?.alpha ?? -1,
+                   ramp.stops.last?.alpha ?? -1, covered == 48 && monotonic ? "ok" : "BAD"))
+    if covered != 48 { failures.append("fade ramp covers \(covered) of 48 chars") }
+    if !monotonic { failures.append("fade ramp alphas are not monotonic toward opaque") }
+    if TextReveal.ramp(head: 0).stops.isEmpty == false { failures.append("fade ramp with no head is not empty") }
+
+    // And that the ramp lands on the right characters when painted: the tail
+    // fades, the settled text keeps its ORIGINAL attributes (so it can't drift
+    // off the dynamic system colors), and the caret glyph stays solid.
+    let sample = NSMutableAttributedString(
+        string: String(repeating: "x", count: 60) + "▍",
+        attributes: [.foregroundColor: NSColor.labelColor]
+    )
+    let painted = RevealFade.paint(sample, reveal: TextReveal(stops: ramp.stops, trailingSkip: 1))
+    func alpha(at index: Int) -> CGFloat {
+        (painted.attribute(.foregroundColor, at: index, effectiveRange: nil) as? NSColor)?.alphaComponent ?? -1
+    }
+    let settled = painted.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor
+    let caretColor = painted.attribute(.foregroundColor, at: 60, effectiveRange: nil) as? NSColor
+    // Note labelColor is itself 85% opaque — the fade MULTIPLIES into whatever
+    // alpha a run already had, so everything here is relative to that base.
+    let base = NSColor.labelColor.alphaComponent
+    let paintOK = settled === NSColor.labelColor       // untouched, not a copy
+        && caretColor === NSColor.labelColor           // caret rides the head, never fades
+        && alpha(at: 59) < base * 0.3                  // newest text is nearly invisible
+        && alpha(at: 30) > alpha(at: 55)               // ramps toward opaque
+    print(String(format: "fade paint: settled %@, caret %@, head %.2f, mid %.2f (base %.2f) %@",
+                 settled === NSColor.labelColor ? "original" : "REWRITTEN",
+                 caretColor === NSColor.labelColor ? "original" : "FADED",
+                 alpha(at: 59), alpha(at: 30), base, paintOK ? "ok" : "BAD"))
+    if !paintOK { failures.append("fade paint landed on the wrong characters") }
+
+    print(failures.isEmpty ? "PASS" : "FAIL: " + failures.joined(separator: "; "))
+    exit(failures.isEmpty ? 0 : 1)
+}
+
 // ChatGPT-subscription auth + streaming checks (no UI):
 //   .build/debug/PopChat --chatgpt-login    interactive: opens the browser OAuth flow
 //   .build/debug/PopChat --smoke-chatgpt    requires a prior login; one streaming turn
@@ -275,10 +461,27 @@ if CommandLine.arguments.contains("--smoke-minsize") {
         let scratch = installBenchmarkConversation(minLength: 2_000)
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
+        // Geometry persisted on a display that is now gone: the panel must come
+        // back FITTING the current screen. Nothing else shrinks it (position()
+        // is satisfied by a 120x80 intersection), so an oversized restore would
+        // put every resize edge off-screen with no way to recover. Stored in the
+        // real defaults domain, so the previous values go back on the way out.
+        let defaults = UserDefaults.standard
+        let priorWidth = defaults.double(forKey: "panelWidth")
+        let priorHeight = defaults.double(forKey: "panelExpandedHeight")
+        defaults.set(9_000, forKey: "panelWidth")
+        defaults.set(9_000, forKey: "panelExpandedHeight")
+        @MainActor func restoreGeometryDefaults() {
+            if priorWidth > 0 { defaults.set(priorWidth, forKey: "panelWidth") }
+            else { defaults.removeObject(forKey: "panelWidth") }
+            if priorHeight > 0 { defaults.set(priorHeight, forKey: "panelExpandedHeight") }
+            else { defaults.removeObject(forKey: "panelExpandedHeight") }
+        }
         let providerStore = ProviderStore()
         let shortcutStore = ShortcutStore()
         let controller = PanelController(providerStore: providerStore, shortcutStore: shortcutStore)
         controller.show()
+        restoreGeometryDefaults() // the panel exists now; don't leave 9000 lying around
         let originalID = controller.chatStore.conversationID
 
         // The enforced minimum lives in the windowWillResize delegate (the
@@ -303,6 +506,7 @@ if CommandLine.arguments.contains("--smoke-minsize") {
 
         @MainActor func report(_ label: String) {
             guard let panel = app.windows.first(where: { $0 is FloatingPanel }) else {
+                restoreGeometryDefaults()
                 print("FAIL: no panel"); exit(1)
             }
             let content = panel.contentRect(forFrameRect: panel.frame)
@@ -353,8 +557,15 @@ if CommandLine.arguments.contains("--smoke-minsize") {
                         let bottomGap = root.isFlipped ? root.bounds.height - frame.maxY : frame.minY
                         gapOK = bottomGap >= 20
                     }
+                    // Oversized restore must have been shrunk onto a real screen.
+                    let frame = panel.frame
+                    let fits = NSScreen.screens.contains { screen in
+                        frame.width <= screen.visibleFrame.width + 0.5
+                            && frame.height <= screen.visibleFrame.height + 0.5
+                    }
+                    print("restored-from-9000x9000 frame=\(Int(frame.width))x\(Int(frame.height)) fitsAScreen=\(fits)")
                     let ok = !controller.chatStore.messages.isEmpty
-                        && height >= 319 && clamped.width >= 519 && clamped.height >= 319 && gapOK
+                        && height >= 319 && clamped.width >= 519 && clamped.height >= 319 && gapOK && fits
                     print(ok ? "PASS" : "FAIL: settled height=\(Int(height)) clamp=\(Int(clamped.width))x\(Int(clamped.height)) gapOK=\(gapOK)")
                     try? FileManager.default.removeItem(at: scratch)
                     exit(ok ? 0 : 1)
@@ -521,6 +732,250 @@ if CommandLine.arguments.contains("--smoke-typing") {
                     }
                     print("PASS")
                     exit(0)
+                }
+            }
+        }
+        app.run()
+    }
+}
+
+// Composer keeps focus when messages appear: types into the empty panel, sends,
+// then types again — through real key events, so a lost first responder shows up
+// as "the keystroke went nowhere" exactly as it does for the user. `/nope` is an
+// unknown slash command: it drives the real send path (rows appended, panel grows
+// 120→440) without touching the network.
+if CommandLine.arguments.contains("--smoke-input") {
+    MainActor.assumeIsolated {
+        let scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("popchat-input-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+        ConversationStore.overrideDirectory = scratch
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        let providerStore = ProviderStore()
+        let controller = PanelController(providerStore: providerStore, shortcutStore: ShortcutStore())
+        controller.show()
+
+        // Unbundled, this binary gets its own UserDefaults domain, so the provider
+        // list is freshly generated and the app's stored key (keyed by the app's
+        // provider UUID) doesn't match. --live borrows POPCHAT_API_KEY like the
+        // other live harnesses; the entry is removed again on the way out.
+        // SecretStore writes the REAL secrets file (it has no scratch override),
+        // so put back exactly what was there — deleting unconditionally would
+        // destroy a key this debug profile already had.
+        var borrowedAccount: String?
+        var displacedSecret: String?
+        if CommandLine.arguments.contains("--live"),
+           let key = ProcessInfo.processInfo.environment["POPCHAT_API_KEY"], !key.isEmpty,
+           let provider = providerStore.selectedProvider {
+            borrowedAccount = provider.id.uuidString
+            displacedSecret = SecretStore.get(account: provider.id.uuidString)
+            SecretStore.set(key, account: provider.id.uuidString)
+        }
+        func cleanup() {
+            if let borrowedAccount {
+                if let displacedSecret {
+                    SecretStore.set(displacedSecret, account: borrowedAccount)
+                } else {
+                    SecretStore.delete(account: borrowedAccount)
+                }
+            }
+            try? FileManager.default.removeItem(at: scratch)
+        }
+
+        func fail(_ message: String) -> Never {
+            print("FAIL: \(message)")
+            cleanup()
+            exit(1)
+        }
+        func composer(in view: NSView?) -> NSTextView? {
+            guard let view else { return nil }
+            if let textView = view as? NSTextView, textView.isEditable { return textView }
+            for sub in view.subviews { if let found = composer(in: sub) { return found } }
+            return nil
+        }
+        // A real keystroke: through the window, to whatever holds first responder.
+        func type(_ character: String, into panel: NSWindow) {
+            guard let event = NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+                windowNumber: panel.windowNumber, context: nil,
+                characters: character, charactersIgnoringModifiers: character,
+                isARepeat: false, keyCode: 0
+            ) else { fail("could not synthesize a keystroke") }
+            panel.sendEvent(event)
+        }
+
+        var step = 0
+        weak var focusedBefore: NSTextView?
+        var lastReplyID: UUID?
+        var markedString = ""
+        var composing = false
+        var committedCJK = 0
+        var lastTargetLength = 0
+        var ticksSinceArrival = 0
+        Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { _ in
+            MainActor.assumeIsolated {
+                guard let panel = app.windows.first(where: { $0 is FloatingPanel }) else { fail("no panel") }
+                step += 1
+                switch step {
+                case 1: return // settle
+                case 2:
+                    guard let field = composer(in: panel.contentView) else { fail("no composer field") }
+                    panel.makeFirstResponder(field)
+                    focusedBefore = field
+                    type("a", into: panel)
+                case 3:
+                    guard let field = composer(in: panel.contentView) else { fail("composer vanished") }
+                    if field.string != "a" { fail("baseline typing did not reach the composer (draft=\(field.string.debugDescription))") }
+                    controller.chatStore.send("/nope") // rows appear, panel grows
+                case 4...5:
+                    return // let the growth animation and layout settle
+                case 6:
+                    guard let field = composer(in: panel.contentView) else { fail("composer vanished after send") }
+                    let same = field === focusedBefore
+                    let isFirst = panel.firstResponder === field
+                    print("after send: sameTextView=\(same) firstResponder=\(isFirst) rows=\(controller.chatStore.messages.count)")
+                    type("b", into: panel)
+                    // Assert on the keystroke, not on first responder: what matters
+                    // is whether the user's next character lands.
+                    if field.string != "ab" {
+                        fail("typing after a new message went nowhere (draft=\(field.string.debugDescription), "
+                             + "sameTextView=\(same), firstResponder=\(isFirst))")
+                    }
+                    print("static rows: ok")
+                    // Phase 2: an IME composition (Chinese/Japanese/Korean pinyin
+                    // etc.) is MARKED text — uncommitted, owned by the input
+                    // context, and destroyed by any write to textView.string. A
+                    // committed keystroke survives a transcript update; marked text
+                    // is the thing that doesn't, so it needs its own check.
+                    field.setMarkedText(
+                        "ni", selectedRange: NSRange(location: 2, length: 0),
+                        replacementRange: NSRange(location: NSNotFound, length: 0)
+                    )
+                    if !field.hasMarkedText() { fail("could not start a marked-text composition") }
+                    markedString = field.string
+                    controller.chatStore.send("/nope again") // rows appear → transcript re-renders
+                case 7:
+                    guard let field = composer(in: panel.contentView) else { fail("composer vanished mid-composition") }
+                    if !field.hasMarkedText() {
+                        fail("IME composition was cancelled by a transcript update — "
+                             + "marked text lost (was \(markedString.debugDescription), now \(field.string.debugDescription))")
+                    }
+                    // And it must still be composable: extend, then commit.
+                    field.setMarkedText(
+                        "niha", selectedRange: NSRange(location: 4, length: 0),
+                        replacementRange: NSRange(location: NSNotFound, length: 0)
+                    )
+                    field.insertText("你好", replacementRange: field.markedRange())
+                    if !field.string.contains("你好") {
+                        fail("committing the composition did not reach the composer (draft=\(field.string.debugDescription))")
+                    }
+                    print("IME composition survived a transcript update and committed: \(field.string.debugDescription)")
+                    // Phase 3 (--live, needs a configured provider): the same checks
+                    // WHILE a reply streams and the typewriter re-renders the
+                    // transcript ~30×/s. That is the state the user reported.
+                    guard CommandLine.arguments.contains("--live") else {
+                        print("PASS (offline; pass --live to also test during streaming)")
+                        cleanup()
+                        exit(0)
+                    }
+                    field.string = ""
+                    controller.chatStore.send("Write about 250 words on the history of the fountain pen.")
+                default:
+                    guard CommandLine.arguments.contains("--live") else { fail("harness ran past its steps") }
+                    guard let field = composer(in: panel.contentView) else { fail("composer vanished mid-stream") }
+                    // Wait for the reply to start, then type one character per tick.
+                    let reply = controller.chatStore.messages.last(where: { $0.role == .assistant })?.text ?? ""
+                    if reply.isEmpty {
+                        if step > 60 {
+                            let rows = controller.chatStore.messages
+                                .map { "\($0.role.rawValue): \($0.text.prefix(120))" }
+                                .joined(separator: "\n  ")
+                            fail("no reply after 20s. Rows:\n  \(rows)")
+                        }
+                        return
+                    }
+                    if composing {
+                        // The composition has now lived across a tick of streaming
+                        // re-renders — the exact thing that used to abort it.
+                        if !field.hasMarkedText() {
+                            fail("IME composition was cancelled by the streaming transcript "
+                                 + "(draft=\(field.string.debugDescription), replyChars=\(reply.count))")
+                        }
+                        field.insertText("好", replacementRange: field.markedRange())
+                        composing = false
+                        if !field.string.hasSuffix("好") {
+                            fail("committing a mid-stream composition failed (draft=\(field.string.debugDescription))")
+                        }
+                        committedCJK += 1
+                    } else {
+                        let before = field.string
+                        type("x", into: panel)
+                        if field.string != before + "x" {
+                            fail("keystroke lost while the reply was streaming "
+                                 + "(draft=\(field.string.debugDescription), expected \((before + "x").debugDescription), "
+                                 + "firstResponder=\(panel.firstResponder === field), replyChars=\(reply.count))")
+                        }
+                        field.setMarkedText(
+                            "hao", selectedRange: NSRange(location: 3, length: 0),
+                            replacementRange: NSRange(location: NSNotFound, length: 0)
+                        )
+                        composing = true
+                    }
+                    // `streamTarget` stops growing the moment the LAST chunk lands —
+                    // the network turn is over there, whatever the typewriter is
+                    // still doing. Ticks since that point measure how long the
+                    // composer stayed locked afterwards.
+                    let target = controller.chatStore.streamTargetLength
+                    if target > lastTargetLength {
+                        lastTargetLength = target
+                        ticksSinceArrival = 0
+                    } else if target > 0 {
+                        ticksSinceArrival += 1
+                    }
+                    if !controller.chatStore.isStreaming, !composing, committedCJK >= 2 {
+                        print("during a \(reply.count)-char reply: \(field.string.count) chars in the draft, "
+                              + "\(committedCJK) IME compositions survived and committed")
+                        // isStreaming must drop when the NETWORK turn ends, not when
+                        // the typewriter finishes revealing: while it is true the send
+                        // button is a Stop button and Return is a no-op, so a lagging
+                        // reveal locked the composer for seconds after the reply had
+                        // arrived. Being mid-reveal here is the point of the check.
+                        let revealed = controller.chatStore.messages.last(where: { $0.role == .assistant })?.text.count ?? 0
+                        let lockedFor = Double(ticksSinceArrival) * 0.4
+                        print(String(format: "composer released %.1fs after the last chunk, with %d/%d chars revealed",
+                                     lockedFor, revealed, target))
+                        if lockedFor > 1.2 {
+                            fail(String(format: "composer stayed locked %.1fs after the reply arrived — "
+                                        + "isStreaming is tracking the typewriter, not the network", lockedFor))
+                        }
+                        // Forking mid-reveal: fork() persists the PARENT and then
+                        // re-points the store at the branch, so a partial row here
+                        // would be frozen into the parent's file and never
+                        // corrected — the reply truncated for good.
+                        if let replyID = controller.chatStore.messages.last(where: { $0.role == .assistant })?.id {
+                            let parentID = controller.chatStore.conversationID
+                            controller.chatStore.fork(at: replyID)
+                            let onDisk = ConversationStore.loadResolved(id: parentID)?.messages
+                                .last(where: { $0.role == .assistant })?.text.count ?? 0
+                            print("forked mid-reveal: parent holds \(onDisk)/\(target) chars on disk")
+                            if onDisk != target {
+                                fail("forking mid-reveal persisted a truncated reply (\(onDisk)/\(target) chars)")
+                            }
+                        }
+                        let userRows = controller.chatStore.messages.filter { $0.role == .user }.count
+                        controller.chatStore.send("second turn")
+                        if controller.chatStore.messages.filter({ $0.role == .user }).count != userRows + 1 {
+                            fail("could not start a new turn while the reply was still revealing")
+                        }
+                        let tail = controller.chatStore.messages.first(where: { $0.id == lastReplyID })?.text.count ?? 0
+                        if tail != target {
+                            fail("sending mid-reveal left the previous reply truncated (\(tail)/\(target) chars)")
+                        }
+                        print("PASS")
+                        cleanup()
+                        exit(0)
+                    }
+                    lastReplyID = controller.chatStore.messages.last(where: { $0.role == .assistant })?.id
                 }
             }
         }
@@ -756,6 +1211,34 @@ if CommandLine.arguments.contains("--smoke-find") {
                 case 8:
                     if findField(in: panel.contentView) != nil { fail("⎋ did not close the find bar") }
                     if !panel.isVisible { fail("⎋ closed the panel instead of the find bar") }
+                    // Same IME rule as the composer, other widget: searching in
+                    // Chinese means composing in this field while the transcript
+                    // may re-render underneath it.
+                    guard let event = NSEvent.keyEvent(
+                        with: .keyDown, location: .zero, modifierFlags: .command, timestamp: 0,
+                        windowNumber: panel.windowNumber, context: nil,
+                        characters: "f", charactersIgnoringModifiers: "f", isARepeat: false, keyCode: 3
+                    ) else { fail("could not synthesize ⌘F") }
+                    _ = panel.performKeyEquivalent(with: event)
+                case 9:
+                    guard let editor = findField(in: panel.contentView)?.currentEditor() as? NSTextView else {
+                        fail("find field did not reopen")
+                    }
+                    editor.setMarkedText(
+                        "zhong", selectedRange: NSRange(location: 5, length: 0),
+                        replacementRange: NSRange(location: NSNotFound, length: 0)
+                    )
+                    if !editor.hasMarkedText() { fail("could not start a composition in the find field") }
+                    controller.chatStore.send("/nope") // rows appear → the whole panel re-renders
+                case 10:
+                    guard let editor = findField(in: panel.contentView)?.currentEditor() as? NSTextView else {
+                        fail("find field vanished mid-composition")
+                    }
+                    if !editor.hasMarkedText() {
+                        fail("IME composition in the find field was cancelled by a transcript update "
+                             + "(now \(editor.string.debugDescription))")
+                    }
+                    print("find-field IME composition survived a transcript update")
                     print("PASS")
                     try? FileManager.default.removeItem(at: scratch)
                     exit(0)

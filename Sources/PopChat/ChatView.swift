@@ -305,6 +305,8 @@ struct ChatView: View {
 
     private var transcriptZone: some View {
         let streamingID = store.isStreaming ? store.messages.last(where: { $0.role == .assistant })?.id : nil
+        let revealingID: UUID? = store.reveal?.messageID
+        let revealFade: TextReveal? = store.reveal?.fade
         let bubbleMaxWidth = max(220, (transcriptWidth - 32) * 0.78)
         let hits = findShown ? findHits : []
         let activeHit = hits.indices.contains(findIndex) ? hits[findIndex] : nil
@@ -319,19 +321,29 @@ struct ChatView: View {
                     // adjustments — an infinite re-layout loop that froze the app.
                     VStack(alignment: .leading, spacing: 14) {
                         ForEach(store.messages) { message in
+                            // Hoisted out of the initializer: inline ternaries here
+                            // tipped the type-checker over its time limit.
+                            let id: UUID = message.id
+                            let revealing: Bool = id == revealingID
+                            // Nil for messages with no hit, so every other row
+                            // stays Equatable-gated while typing.
+                            let rowFind: MessageFind? = matchedIDs.contains(id)
+                                ? MessageFind(
+                                    query: query,
+                                    activeOccurrence: activeHit?.messageID == id ? activeHit?.occurrence : nil
+                                )
+                                : nil
                             MessageRow(
                                 message: message,
-                                showCaret: message.id == streamingID,
+                                // The caret rides the fade head (Delta 4), so it
+                                // outlives the NETWORK turn that streamingID
+                                // tracks — the reveal can still be typing.
+                                showCaret: id == streamingID || revealing,
                                 bubbleMaxWidth: bubbleMaxWidth,
-                                // Nil for messages with no hit, so every other
-                                // row stays Equatable-gated while typing.
-                                find: matchedIDs.contains(message.id)
-                                    ? MessageFind(
-                                        query: query,
-                                        activeOccurrence: activeHit?.messageID == message.id ? activeHit?.occurrence : nil
-                                    )
-                                    : nil,
-                                onFork: { store.fork(at: message.id) }
+                                find: rowFind,
+                                reveal: revealing ? revealFade : nil,
+                                onFork: { store.fork(at: id) },
+                                fullText: { store.fullText(of: id) }
                             )
                             .equatable()
                             .transition(rowTransition(for: message.role))
@@ -660,8 +672,16 @@ private struct MessageRow: View, Equatable {
     /// Nil unless this message contains a ⌘F hit. Part of ==, so a row repaints
     /// when its own highlights change and stays gated otherwise.
     var find: MessageFind?
+    /// Delta 4 streaming fade. Also part of ==: the fade advances on ticks where
+    /// `message.text` does NOT change (running out after the last commit), and
+    /// without this the row would stay gated and the head would never settle.
+    var reveal: TextReveal?
     /// Ignored by ==: it captures only stable references (store + message id).
     var onFork: () -> Void = {}
+    /// Likewise ignored by ==. Resolves at click time to the text that has
+    /// ARRIVED, which differs from `message.text` while the typewriter is still
+    /// revealing this row — Copy promises the whole response.
+    var fullText: () -> String = { "" }
 
     @AppStorage("bubbleStyle") private var bubbleStyleRaw = BubbleStyle.accentTint.rawValue
     @AppStorage("accentColor") private var accentHex = Theme.defaultAccentHex
@@ -678,6 +698,7 @@ private struct MessageRow: View, Equatable {
         lhs.message == rhs.message
             && lhs.showCaret == rhs.showCaret
             && lhs.find == rhs.find
+            && lhs.reveal == rhs.reveal
             && abs(lhs.bubbleMaxWidth - rhs.bubbleMaxWidth) < 0.5
     }
 
@@ -716,7 +737,9 @@ private struct MessageRow: View, Equatable {
             .frame(maxWidth: .infinity, alignment: .trailing)
         case .assistant:
             VStack(alignment: .leading, spacing: 4) {
-                AssistantMessageView(text: message.text, showCaret: showCaret, find: find)
+                AssistantMessageView(
+                    text: message.text, showCaret: showCaret, find: find, reveal: reveal
+                )
                 // Always visible once the response is complete; occupies its
                 // space during streaming (opacity only) so finishing never
                 // reflows the transcript.
@@ -724,7 +747,7 @@ private struct MessageRow: View, Equatable {
                     HStack(spacing: 12) {
                         Button {
                             NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(message.text, forType: .string)
+                            NSPasteboard.general.setString(fullText(), forType: .string)
                             copied = true
                             DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { copied = false }
                         } label: {
@@ -751,7 +774,7 @@ private struct MessageRow: View, Equatable {
             .contextMenu {
                 Button("Copy Message") {
                     NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(message.text, forType: .string)
+                    NSPasteboard.general.setString(fullText(), forType: .string)
                 }
                 Button("Fork Here", action: onFork)
             }
