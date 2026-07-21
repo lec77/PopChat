@@ -23,6 +23,7 @@ struct ChatView: View {
     var onCompactHeightChange: (CGFloat) -> Void = { _ in }
 
     @State private var composerModel = ComposerModel()
+    @State private var draftEditorShown = false
     @State private var dropTargeted = false
     @State private var historyShown = false
     @State private var modelPillHovered = false
@@ -60,7 +61,7 @@ struct ChatView: View {
                     .allowsHitTesting(false)
             }
         }
-        .frame(minWidth: 480, minHeight: store.messages.isEmpty ? nil : 320)
+        .frame(minWidth: 480, minHeight: store.messages.isEmpty && !draftEditorShown ? nil : 320)
         .dropDestination(for: URL.self) { urls, _ in
             composerModel.handleFiles(urls)
             return true
@@ -68,16 +69,25 @@ struct ChatView: View {
             dropTargeted = targeted
         }
         .onExitCommand { onClose() }
+        .onChange(of: draftEditorShown) { _, shown in
+            // The editor needs real height even when the chat is empty; the
+            // compact preference resumes reporting when the editor closes.
+            if store.messages.isEmpty, shown {
+                onCompactHeightChange(440)
+            }
+        }
     }
 
     private var mainContent: some View {
         VStack(spacing: 0) {
-            if store.messages.isEmpty {
-                pillsRow
-                    .padding(12)
-                    .background(WindowDragStrip())
-            } else {
-                transcriptZone
+            if !draftEditorShown {
+                if store.messages.isEmpty {
+                    pillsRow
+                        .padding(12)
+                        .background(WindowDragStrip())
+                } else {
+                    transcriptZone
+                }
             }
             ComposerView(
                 model: composerModel,
@@ -85,9 +95,11 @@ struct ChatView: View {
                 isStreaming: store.isStreaming,
                 isEmptyChat: store.messages.isEmpty,
                 focusBump: state.focusBump,
+                editorMode: $draftEditorShown,
                 onSend: { text, attachments in store.send(text, attachments: attachments) },
                 onStop: { store.stop() },
-                onFocusRequest: { state.focusBump += 1 }
+                onFocusRequest: { state.focusBump += 1 },
+                onClose: onClose
             )
         }
         .background(
@@ -96,7 +108,7 @@ struct ChatView: View {
             }
         )
         .onPreferenceChange(ContentHeightKey.self) { height in
-            if store.messages.isEmpty {
+            if store.messages.isEmpty, !draftEditorShown {
                 onCompactHeightChange(height)
             }
         }

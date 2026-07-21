@@ -265,16 +265,16 @@ if CommandLine.arguments.contains("--smoke-typing") {
         func focusedEditor() -> NSTextView? {
             guard let panel = app.windows.first(where: { $0 is FloatingPanel }) else { return nil }
             if let editor = panel.firstResponder as? NSTextView { return editor }
-            func findField(_ view: NSView?) -> NSTextField? {
+            func findTextView(_ view: NSView?) -> NSTextView? {
                 guard let view else { return nil }
-                if let field = view as? NSTextField, field.isEditable { return field }
+                if let textView = view as? NSTextView, textView.isEditable { return textView }
                 for sub in view.subviews {
-                    if let found = findField(sub) { return found }
+                    if let found = findTextView(sub) { return found }
                 }
                 return nil
             }
-            if let field = findField(panel.contentView) {
-                panel.makeFirstResponder(field)
+            if let textView = findTextView(panel.contentView) {
+                panel.makeFirstResponder(textView)
                 return panel.firstResponder as? NSTextView
             }
             return nil
