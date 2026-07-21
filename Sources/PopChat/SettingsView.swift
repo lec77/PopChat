@@ -2,27 +2,66 @@ import SwiftUI
 import KeyboardShortcuts
 import ServiceManagement
 
+/// System Settings-style window: toolbar tabs over a grouped form per tab.
 struct SettingsView: View {
+    enum Tab: String, CaseIterable, Identifiable {
+        case general, providers, webSearch, commands, hotkey
+
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .general: "General"
+            case .providers: "Providers"
+            case .webSearch: "Web Search"
+            case .commands: "Commands"
+            case .hotkey: "Hotkey"
+            }
+        }
+        var icon: String {
+            switch self {
+            case .general: "gearshape"
+            case .providers: "key"
+            case .webSearch: "globe"
+            case .commands: "slash.circle"
+            case .hotkey: "keyboard"
+            }
+        }
+    }
+
     @ObservedObject var store: ProviderStore
     @ObservedObject var shortcutStore: ShortcutStore
+    @State private var tab: Tab = .general
     @State private var apiKeyDraft = ""
     @State private var searchKeyDraft = ""
     @AppStorage("searchEngine") private var searchEngine = SearchEngineChoice.duckduckgo.rawValue
     @AppStorage("webSearchEnabled") private var webEnabled = true
+    @AppStorage("accentColor") private var accentHex = Theme.defaultAccentHex
+    @AppStorage("bubbleStyle") private var bubbleStyleRaw = BubbleStyle.accentTint.rawValue
+    @AppStorage("streamingMode") private var streamingModeRaw = StreamingMode.perCharacter.rawValue
+    @AppStorage("liquidGlass") private var liquidGlass = true
+    @AppStorage("panelTint") private var panelTint = -1.0
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @State private var loginItemError: String?
 
     var body: some View {
-        Form {
-            hotkeySection
-            generalSection
-            providerSection
-            webSearchSection
-            shortcutsSection
+        VStack(spacing: 0) {
+            tabBar
+            Divider()
+            Group {
+                switch tab {
+                case .general: generalTab
+                case .providers: providersTab
+                case .webSearch: webSearchTab
+                case .commands: commandsTab
+                case .hotkey: hotkeyTab
+                }
+            }
+            .formStyle(.grouped)
         }
-        .formStyle(.grouped)
-        .frame(width: 520, height: 620)
+        .frame(width: 540, height: 620)
         .onAppear {
             apiKeyDraft = store.currentKey()
             searchKeyDraft = currentSearchKey()
@@ -31,124 +70,280 @@ struct SettingsView: View {
         .onChange(of: searchEngine) { _, _ in searchKeyDraft = currentSearchKey() }
     }
 
-    // MARK: - Sections
-
-    private var hotkeySection: some View {
-        Section("Hotkey") {
-            KeyboardShortcuts.Recorder("Toggle PopChat:", name: .togglePopChat)
-            Text("If ⌥Space is taken by another app (e.g. ChatGPT), unbind it there or record a different shortcut here.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+    private var tabBar: some View {
+        HStack(spacing: 6) {
+            ForEach(Tab.allCases) { item in
+                Button {
+                    tab = item
+                } label: {
+                    VStack(spacing: 3) {
+                        Image(systemName: item.icon)
+                            .font(.system(size: 19))
+                        Text(item.label)
+                            .font(.system(size: 10.5))
+                    }
+                    .frame(width: 76, height: 52)
+                    .background(
+                        tab == item ? Color.primary.opacity(0.07) : .clear,
+                        in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    )
+                    .foregroundStyle(tab == item ? Color.accentColor : Color.secondary)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
         }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 8)
     }
 
-    private var generalSection: some View {
-        Section("General") {
-            Toggle("Launch PopChat at login", isOn: $launchAtLogin)
-                .onChange(of: launchAtLogin) { _, enabled in
-                    do {
-                        if enabled {
-                            try SMAppService.mainApp.register()
-                        } else {
-                            try SMAppService.mainApp.unregister()
+    // MARK: - General
+
+    private var generalTab: some View {
+        Form {
+            Section {
+                Toggle("Launch PopChat at login", isOn: $launchAtLogin)
+                    .onChange(of: launchAtLogin) { _, enabled in
+                        do {
+                            if enabled {
+                                try SMAppService.mainApp.register()
+                            } else {
+                                try SMAppService.mainApp.unregister()
+                            }
+                            loginItemError = nil
+                        } catch {
+                            loginItemError = "Couldn't update login item: \(error.localizedDescription)"
+                            launchAtLogin = SMAppService.mainApp.status == .enabled
                         }
-                        loginItemError = nil
-                    } catch {
-                        loginItemError = "Couldn't update login item: \(error.localizedDescription)"
-                        launchAtLogin = SMAppService.mainApp.status == .enabled
                     }
-                }
-            if let error = loginItemError {
-                Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.red)
-            }
-        }
-    }
-
-    private var providerSection: some View {
-        Section("Provider") {
-            Picker("Provider", selection: $store.selectedID) {
-                ForEach(store.providers) { provider in
-                    Text(provider.name).tag(provider.id)
-                }
-            }
-
-            if let index = store.providers.firstIndex(where: { $0.id == store.selectedID }) {
-                if !store.providers[index].isPreset {
-                    TextField("Name", text: $store.providers[index].name)
-                }
-                TextField("Base URL", text: $store.providers[index].baseURL)
-                SecureField("API Key", text: $apiKeyDraft)
-                    .onChange(of: apiKeyDraft) { _, newValue in
-                        store.setKey(newValue)
-                    }
-                modelRow
-                if let error = store.modelFetchError {
+                if let error = loginItemError {
                     Label(error, systemImage: "exclamationmark.triangle.fill")
                         .font(.caption)
                         .foregroundStyle(.red)
                 }
             }
-
-            HStack {
-                Button("Add Custom Provider") { store.addCustom() }
-                if store.selectedProvider?.isPreset == false {
-                    Button("Remove", role: .destructive) { store.removeSelected() }
-                }
-            }
-            Text("Keys are stored locally in ~/Library/Application Support/PopChat/secrets.json (user-only permissions, not synced). Include /v1 in custom base URLs where the provider requires it; local servers (Ollama, LM Studio) need no key.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    private var webSearchSection: some View {
-        Section("Web Search") {
-            Toggle("Web access available to the model", isOn: $webEnabled)
-            Picker("Search engine", selection: $searchEngine) {
-                ForEach(SearchEngineChoice.allCases) { choice in
-                    Text(choice.label).tag(choice.rawValue)
-                }
-            }
-            if let account = SearchEngineChoice(rawValue: searchEngine)?.apiKeyAccount {
-                SecureField("Search API Key", text: $searchKeyDraft)
-                    .onChange(of: searchKeyDraft) { _, newValue in
-                        SecretStore.set(newValue, account: account)
+            Section {
+                accentRow
+                Picker("Your message style", selection: $bubbleStyleRaw) {
+                    ForEach(BubbleStyle.allCases) { style in
+                        Text(style.label).tag(style.rawValue)
                     }
+                }
+                .pickerStyle(.segmented)
+                liquidGlassRow
+                panelTintRow
+                Picker("Streaming text", selection: $streamingModeRaw) {
+                    ForEach(StreamingMode.allCases) { mode in
+                        Text(mode.label).tag(mode.rawValue)
+                    }
+                }
+                .pickerStyle(.segmented)
+                previewRow
+            } header: {
+                Text("Chat Style")
+            } footer: {
+                Text("Applies to your messages in the panel. Defaults: Accent tint, Blue, Per-character streaming. Panel tint defaults to the system glass appearance; the slider overrides it for PopChat only. Reduce Transparency always wins.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
-            Text("The model decides when to search (web_search + fetch_url tools, max 5 rounds). Provider-native uses OpenRouter's server-side plugin and only applies when OpenRouter is the active provider; other choices fall back to DuckDuckGo with a visible notice.")
-                .font(.caption)
+        }
+    }
+
+    private var accentRow: some View {
+        HStack {
+            Text("Accent color")
+            Spacer()
+            ForEach(Theme.accentOptions, id: \.self) { hex in
+                let selected = hex == accentHex
+                Button {
+                    accentHex = hex
+                } label: {
+                    Circle()
+                        .fill(Theme.color(hex))
+                        .frame(width: 18, height: 18)
+                        .padding(2)
+                        .overlay(
+                            Circle()
+                                .strokeBorder(Theme.color(hex), lineWidth: 2)
+                                .opacity(selected ? 1 : 0)
+                        )
+                }
+                .buttonStyle(.plain)
+                .help(hex)
+            }
+        }
+    }
+
+    private var liquidGlassRow: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Toggle("Liquid glass", isOn: reduceTransparency ? .constant(false) : $liquidGlass)
+                .disabled(reduceTransparency)
+            Text(reduceTransparency
+                ? "Off because Reduce Transparency is enabled in System Settings."
+                : "Turn off for a solid panel and lower GPU use")
+                .font(.system(size: 11))
                 .foregroundStyle(.secondary)
         }
     }
 
-    private var shortcutsSection: some View {
-        Section("Slash Commands") {
-            ForEach($shortcutStore.shortcuts) { $shortcut in
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("/").foregroundStyle(.secondary)
-                        TextField("name", text: $shortcut.name)
-                            .frame(width: 140)
-                        Spacer()
-                        Button(role: .destructive) {
-                            shortcutStore.remove(id: shortcut.id)
-                        } label: {
-                            Image(systemName: "trash")
+    private var panelTintRow: some View {
+        let disabled = !liquidGlass || reduceTransparency
+        return HStack(spacing: 8) {
+            Text("Panel tint")
+            Spacer()
+            Text("Clear")
+                .font(.system(size: 10.5))
+                .foregroundStyle(.tertiary)
+            Slider(
+                value: Binding(
+                    get: { panelTint < 0 ? 0.5 : panelTint },
+                    set: { panelTint = $0 }
+                ),
+                in: 0...1
+            )
+            .frame(width: 180)
+            Text("Tinted")
+                .font(.system(size: 10.5))
+                .foregroundStyle(.tertiary)
+        }
+        .disabled(disabled)
+        .opacity(disabled ? 0.4 : 1)
+    }
+
+    private var previewRow: some View {
+        let style = BubbleStyle(rawValue: bubbleStyleRaw) ?? .accentTint
+        return HStack {
+            Text("Preview")
+                .foregroundStyle(.secondary)
+            Spacer()
+            Text("Looks good — ship it")
+                .font(.system(size: 13))
+                .foregroundStyle(Theme.bubbleForeground(style: style))
+                .padding(.vertical, 9)
+                .padding(.horizontal, 14)
+                .background(
+                    Theme.bubbleFill(style: style, accentHex: accentHex, dark: scheme == .dark),
+                    in: RoundedRectangle(cornerRadius: 18, style: .continuous)
+                )
+        }
+    }
+
+    // MARK: - Providers
+
+    private var providersTab: some View {
+        Form {
+            Section {
+                Picker("Provider", selection: $store.selectedID) {
+                    ForEach(store.providers) { provider in
+                        Text(provider.name).tag(provider.id)
+                    }
+                }
+
+                if let index = store.providers.firstIndex(where: { $0.id == store.selectedID }) {
+                    if !store.providers[index].isPreset {
+                        TextField("Name", text: $store.providers[index].name)
+                    }
+                    TextField("Base URL", text: $store.providers[index].baseURL)
+                        .help("Include /v1 where the provider requires it; local servers (Ollama, LM Studio) need no key.")
+                    SecureField("API Key", text: $apiKeyDraft)
+                        .onChange(of: apiKeyDraft) { _, newValue in
+                            store.setKey(newValue)
                         }
-                        .buttonStyle(.plain)
+                    modelRow
+                    if let error = store.modelFetchError {
+                        Label(error, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.red)
                     }
-                    TextField("Prompt template — {input} marks where your text goes", text: $shortcut.template, axis: .vertical)
-                        .lineLimit(2...4)
-                        .font(.callout)
                 }
-                .padding(.vertical, 2)
+
+                HStack {
+                    Button("Add Custom Provider") { store.addCustom() }
+                    if store.selectedProvider?.isPreset == false {
+                        Button("Remove", role: .destructive) { store.removeSelected() }
+                    }
+                }
+            } footer: {
+                Text("Keys are stored locally in Application Support, never synced.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .help("~/Library/Application Support/PopChat/secrets.json, user-only permissions.")
             }
-            Button("Add Shortcut") { shortcutStore.add() }
-            Text("Type “/name your text” in the chat field. The compact form is shown in the transcript; the expanded template is what the model receives.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - Web Search
+
+    private var webSearchTab: some View {
+        Form {
+            Section {
+                Toggle("Web access available to the model", isOn: $webEnabled)
+                Picker("Search engine", selection: $searchEngine) {
+                    ForEach(SearchEngineChoice.allCases) { choice in
+                        Text(choice.label).tag(choice.rawValue)
+                    }
+                }
+                if let account = SearchEngineChoice(rawValue: searchEngine)?.apiKeyAccount {
+                    SecureField("Search API Key", text: $searchKeyDraft)
+                        .onChange(of: searchKeyDraft) { _, newValue in
+                            SecretStore.set(newValue, account: account)
+                        }
+                }
+            } footer: {
+                Text("The model decides when to search (max 5 tool rounds).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .help("web_search + fetch_url tools. Provider-native uses OpenRouter's server-side plugin and only applies when OpenRouter is the active provider; other choices fall back to DuckDuckGo with a visible notice.")
+            }
+        }
+    }
+
+    // MARK: - Commands
+
+    private var commandsTab: some View {
+        Form {
+            Section {
+                ForEach($shortcutStore.shortcuts) { $shortcut in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text("/").foregroundStyle(.secondary)
+                            TextField("name", text: $shortcut.name)
+                                .frame(width: 140)
+                            Spacer()
+                            Button(role: .destructive) {
+                                shortcutStore.remove(id: shortcut.id)
+                            } label: {
+                                Image(systemName: "trash")
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        TextField("Prompt template — {input} marks where your text goes", text: $shortcut.template, axis: .vertical)
+                            .lineLimit(2...4)
+                            .font(.callout)
+                    }
+                    .padding(.vertical, 2)
+                }
+                Button("Add Shortcut") { shortcutStore.add() }
+            } footer: {
+                Text("Type “/name your text” in the chat field.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .help("The compact form is shown in the transcript; the expanded template is what the model receives.")
+            }
+        }
+    }
+
+    // MARK: - Hotkey
+
+    private var hotkeyTab: some View {
+        Form {
+            Section {
+                KeyboardShortcuts.Recorder("Toggle PopChat:", name: .togglePopChat)
+            } footer: {
+                Text("If ⌥Space is taken by another app, unbind it there or record a different shortcut.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 

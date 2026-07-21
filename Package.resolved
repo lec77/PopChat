@@ -1,5 +1,5 @@
 {
-  "originHash" : "acd7839b527176aaea59ab320d8150ec0e9a20b510c3b520e5ac7170f552a586",
+  "originHash" : "94ff0a4f356def5bf610f6d5db3b8cccb30ad9ad0b615c1563213ab407a04b90",
   "pins" : [
     {
       "identity" : "corexlsx",
@@ -17,6 +17,24 @@
       "state" : {
         "revision" : "ac302e21da5883f4bd0490cbd0cb710b08740500",
         "version" : "1.15.0"
+      }
+    },
+    {
+      "identity" : "splash",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/JohnSundell/Splash",
+      "state" : {
+        "revision" : "7f4df436eb78fe64fe2c32c58006e9949fa28ad8",
+        "version" : "0.16.0"
+      }
+    },
+    {
+      "identity" : "swiftmath",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/mgriebling/SwiftMath",
+      "state" : {
+        "revision" : "fa8244ed032f4a1ade4cb0571bf87d2f1a9fd2d7",
+        "version" : "1.7.3"
       }
     },
     {

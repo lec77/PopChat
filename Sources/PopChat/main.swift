@@ -85,6 +85,68 @@ if let flagIndex = CommandLine.arguments.firstIndex(of: "--smoke-file"),
     RunLoop.main.run()
 }
 
+// UI layout stress (no network): builds the real panel — which auto-resumes the
+// most recent conversation — and bounces the transcript scroll while a watchdog
+// thread checks main-thread responsiveness. Catches layout-convergence hangs.
+if CommandLine.arguments.contains("--smoke-scroll") {
+    nonisolated(unsafe) var lastPong = Date()
+    Thread.detachNewThread {
+        while true {
+            DispatchQueue.main.async { lastPong = Date() }
+            Thread.sleep(forTimeInterval: 0.5)
+            if Date().timeIntervalSince(lastPong) > 3 {
+                print("HANG pid=\(ProcessInfo.processInfo.processIdentifier) — main thread stalled >3s")
+                fflush(stdout)
+                Thread.sleep(forTimeInterval: 60) // stay alive so the stack can be sampled
+                exit(2)
+            }
+        }
+    }
+    MainActor.assumeIsolated {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        let providerStore = ProviderStore()
+        let shortcutStore = ShortcutStore()
+        let controller = PanelController(providerStore: providerStore, shortcutStore: shortcutStore)
+        controller.show()
+
+        func findScrollView(_ view: NSView?) -> NSScrollView? {
+            guard let view else { return nil }
+            if let scroll = view as? NSScrollView { return scroll }
+            for sub in view.subviews {
+                if let found = findScrollView(sub) { return found }
+            }
+            return nil
+        }
+
+        var elapsed = 0.0
+        Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in
+            MainActor.assumeIsolated {
+                elapsed += 0.05
+                guard let panel = app.windows.first(where: { $0 is FloatingPanel }),
+                      let scroll = findScrollView(panel.contentView),
+                      let doc = scroll.documentView else {
+                    if elapsed > 3 { print("FAIL: no transcript scroll view found"); exit(1) }
+                    return
+                }
+                let maxY = max(0, doc.frame.height - scroll.contentSize.height)
+                let phase = (sin(elapsed * 1.5) + 1) / 2
+                scroll.contentView.scroll(to: NSPoint(x: 0, y: maxY * phase))
+                scroll.reflectScrolledClipView(scroll.contentView)
+                if Int(elapsed * 20) % 20 == 0 {
+                    print(String(format: "t=%.1fs offset=%.0f of %.0f", elapsed, maxY * phase, maxY))
+                    fflush(stdout)
+                }
+                if elapsed >= 12 {
+                    print("PASS: 12s of scrolling, main thread responsive")
+                    exit(0)
+                }
+            }
+        }
+        app.run()
+    }
+}
+
 // NSApplication.delegate is held unowned — the top-level constant keeps it alive
 // for the app's lifetime.
 let delegate = MainActor.assumeIsolated { AppDelegate() }

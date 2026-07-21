@@ -11,6 +11,14 @@ struct ConversationMeta: Identifiable, Equatable {
     let id: UUID
     let title: String
     let updatedAt: Date
+    /// One-line preview for the history popover (last real message).
+    let snippet: String
+
+    static func snippet(for messages: [ChatMessage]) -> String {
+        let last = messages.last { ($0.role == .user || $0.role == .assistant) && !$0.text.isEmpty }
+        let flattened = (last?.text ?? "").replacingOccurrences(of: "\n", with: " ")
+        return String(flattened.prefix(120))
+    }
 }
 
 /// One JSON file per conversation in Application Support. Attachments are persisted
@@ -57,7 +65,12 @@ enum ConversationStore {
         for file in files where file.pathExtension == "json" {
             guard let data = try? Data(contentsOf: file),
                   let conversation = try? decoder.decode(Conversation.self, from: data) else { continue }
-            metas.append(ConversationMeta(id: conversation.id, title: conversation.title, updatedAt: conversation.updatedAt))
+            metas.append(ConversationMeta(
+                id: conversation.id,
+                title: conversation.title,
+                updatedAt: conversation.updatedAt,
+                snippet: ConversationMeta.snippet(for: conversation.messages)
+            ))
         }
         metas.sort { $0.updatedAt > $1.updatedAt }
         for stale in metas.dropFirst(maxStored) {

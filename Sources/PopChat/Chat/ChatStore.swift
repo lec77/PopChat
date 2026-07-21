@@ -30,6 +30,14 @@ final class ChatStore: ObservableObject {
     private let shortcutStore: ShortcutStore
     private var streamTask: Task<Void, Never>?
 
+    // Per-character streaming: partial snapshots land in `streamTarget`; a drain
+    // task reveals them at ~180 chars/s (accelerating when it falls behind, so the
+    // display never lags the stream noticeably). Stop flushes instantly.
+    private var streamTarget = ""
+    private var streamFinished = false
+    private var streamingMessageID: UUID?
+    private var drainTask: Task<Void, Never>?
+
     init(providerStore: ProviderStore, shortcutStore: ShortcutStore) {
         self.providerStore = providerStore
         self.shortcutStore = shortcutStore
@@ -103,8 +111,15 @@ final class ChatStore: ObservableObject {
             .map { OpenAIChatClient.WireMessage(role: $0.role.rawValue, content: Self.wireContent(for: $0)) }
 
         persist()
-        messages.append(ChatMessage(role: .assistant, text: ""))
+        let assistantMessage = ChatMessage(role: .assistant, text: "")
+        messages.append(assistantMessage)
         isStreaming = true
+
+        let typewriter = StreamingMode(rawValue: UserDefaults.standard.string(forKey: "streamingMode") ?? "")
+            ?? .perCharacter
+        streamTarget = ""
+        streamFinished = false
+        streamingMessageID = assistantMessage.id
 
         streamTask = Task {
             // The streaming assistant row stays last; activity rows are inserted above it.
@@ -112,7 +127,12 @@ final class ChatStore: ObservableObject {
             for await event in OpenAIChatClient.run(history: history, config: config, webAccess: webAccess) {
                 switch event {
                 case .partial(let text), .done(let text):
-                    messages[assistantIndex].text = text
+                    streamTarget = text
+                    if typewriter == .perCharacter {
+                        startDrain(messageID: assistantMessage.id)
+                    } else {
+                        messages[assistantIndex].text = text
+                    }
                 case .activity(let text):
                     messages.insert(ChatMessage(role: .activity, text: text), at: assistantIndex)
                     assistantIndex += 1
@@ -120,12 +140,41 @@ final class ChatStore: ObservableObject {
                     messages.append(ChatMessage(role: .error, text: message))
                 }
             }
-            if messages.indices.contains(assistantIndex), messages[assistantIndex].role == .assistant,
-               messages[assistantIndex].text.isEmpty {
-                messages.remove(at: assistantIndex)
+            streamFinished = true
+            await drainTask?.value
+            drainTask = nil
+            if messages.indices.contains(assistantIndex), messages[assistantIndex].role == .assistant {
+                if streamTarget.isEmpty {
+                    messages.remove(at: assistantIndex)
+                } else {
+                    messages[assistantIndex].text = streamTarget
+                }
             }
+            streamingMessageID = nil
             isStreaming = false
             persist()
+        }
+    }
+
+    private func startDrain(messageID: UUID) {
+        guard drainTask == nil else { return }
+        drainTask = Task { [weak self] in
+            while let self, !Task.isCancelled {
+                guard let index = self.messages.firstIndex(where: { $0.id == messageID }) else { return }
+                let displayed = self.messages[index].text
+                let target = self.streamTarget
+                if displayed.count >= target.count {
+                    if self.streamFinished { return }
+                } else if target.hasPrefix(displayed) {
+                    let backlog = target.count - displayed.count
+                    let step = min(backlog, max(6, backlog / 12))
+                    self.messages[index].text = String(target.prefix(displayed.count + step))
+                } else {
+                    // Non-monotonic snapshot (new tool round) — jump to it.
+                    self.messages[index].text = target
+                }
+                try? await Task.sleep(for: .milliseconds(33))
+            }
         }
     }
 
@@ -194,6 +243,22 @@ final class ChatStore: ObservableObject {
 
     func stop() {
         streamTask?.cancel()
+        drainTask?.cancel()
+        drainTask = nil
+        // Flush the typewriter buffer so everything received is visible at once.
+        if let id = streamingMessageID, let index = messages.firstIndex(where: { $0.id == id }) {
+            messages[index].text = streamTarget
+        }
+    }
+
+    func deleteConversation(_ id: UUID) {
+        ConversationStore.delete(id: id)
+        recent.removeAll { $0.id == id }
+        if id == conversationID {
+            stop()
+            conversationID = UUID()
+            messages.removeAll()
+        }
     }
 
     func newChat() {
@@ -229,7 +294,12 @@ final class ChatStore: ObservableObject {
         )
         ConversationStore.save(conversation)
         recent.removeAll { $0.id == conversationID }
-        recent.insert(ConversationMeta(id: conversationID, title: title, updatedAt: conversation.updatedAt), at: 0)
+        recent.insert(ConversationMeta(
+            id: conversationID,
+            title: title,
+            updatedAt: conversation.updatedAt,
+            snippet: ConversationMeta.snippet(for: messages)
+        ), at: 0)
     }
 
     private static func title(for messages: [ChatMessage]) -> String {

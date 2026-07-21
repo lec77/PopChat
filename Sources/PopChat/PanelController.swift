@@ -51,6 +51,9 @@ final class PanelController: NSObject, NSWindowDelegate {
         )
         panel.delegate = self
         panel.onCancel = { [weak self] in self?.hide() }
+        panel.onAttachablePaste = {
+            NotificationCenter.default.post(name: .popChatAttachPasteboard, object: nil)
+        }
         panel.contentView = NSHostingView(
             rootView: ChatView(
                 state: state,
@@ -77,6 +80,12 @@ final class PanelController: NSObject, NSWindowDelegate {
         }
     }
 
+    private var reduceMotion: Bool {
+        NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+
+    // Summon: fade + scale 0.97→1 + rise from 8pt below. Dismiss: quick fade with a
+    // slight shrink. Both collapse to opacity-only under Reduce Motion.
     func show() {
         isHiding = false
         if chatStore.messages.isEmpty {
@@ -85,11 +94,15 @@ final class PanelController: NSObject, NSWindowDelegate {
         position()
         let target = panel.frame
         panel.alphaValue = 0
-        panel.setFrame(target.offsetBy(dx: 0, dy: -10), display: false)
+        if !reduceMotion {
+            var start = target.insetBy(dx: target.width * 0.015, dy: target.height * 0.015)
+            start.origin.y -= 8
+            panel.setFrame(start, display: false)
+        }
         panel.makeKeyAndOrderFront(nil)
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.18
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            context.duration = 0.28
+            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.3, 1)
             panel.animator().alphaValue = 1
             panel.animator().setFrame(target, display: true)
         }
@@ -99,15 +112,22 @@ final class PanelController: NSObject, NSWindowDelegate {
     func hide() {
         guard panel.isVisible, !isHiding else { return }
         isHiding = true
+        let restingFrame = panel.frame
         NSAnimationContext.runAnimationGroup({ [weak self] context in
-            context.duration = 0.13
+            guard let self else { return }
+            context.duration = 0.16
             context.timingFunction = CAMediaTimingFunction(name: .easeIn)
-            self?.panel.animator().alphaValue = 0
+            panel.animator().alphaValue = 0
+            if !reduceMotion {
+                let shrunk = restingFrame.insetBy(dx: restingFrame.width * 0.01, dy: restingFrame.height * 0.01)
+                panel.animator().setFrame(shrunk, display: true)
+            }
         }, completionHandler: { [weak self] in
             MainActor.assumeIsolated {
                 guard let self, self.isHiding else { return }
                 self.panel.orderOut(nil)
                 self.panel.alphaValue = 1
+                self.panel.setFrame(restingFrame, display: false)
                 self.isHiding = false
             }
         })
