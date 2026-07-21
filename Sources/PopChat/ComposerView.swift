@@ -116,7 +116,9 @@ struct ComposerView: View {
         .animation(.easeOut(duration: 0.12), value: model.attachNotice)
         .onAppear { inputFocused = true }
         .onChange(of: focusBump) { _, _ in inputFocused = true }
-        .onChange(of: draft) { _, _ in completionIndex = 0 }
+        .onChange(of: draft) { _, _ in
+            if completionIndex != 0 { completionIndex = 0 }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .popChatAttachPasteboard)) { _ in
             model.handlePasteboard()
         }

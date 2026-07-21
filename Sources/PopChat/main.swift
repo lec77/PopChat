@@ -59,6 +59,28 @@ if CommandLine.arguments.contains("--smoke-persist") {
     print("listCount=\(list.count) firstTitle=\(list.first?.title ?? "-") loadedMessages=\(loaded?.messages.count ?? -1) roundTripText=\(loaded?.messages.last?.text ?? "-")")
     ConversationStore.delete(id: conversation.id)
     print("afterDelete=\(ConversationStore.listRecent().filter { $0.id == conversation.id }.count)")
+
+    // Fork tree round-trip: tail-only storage, chain resolution, and
+    // materialization of children when the parent is deleted.
+    let sharedTip = ChatMessage(role: .assistant, text: "shared tip")
+    let parent = Conversation(
+        id: UUID(), title: "Fork parent", updatedAt: Date(),
+        messages: [ChatMessage(role: .user, text: "root q"), sharedTip,
+                   ChatMessage(role: .user, text: "parent-only followup")]
+    )
+    let child = Conversation(
+        id: UUID(), title: "Fork child", updatedAt: Date(),
+        messages: [ChatMessage(role: .user, text: "diverged")],
+        parentID: parent.id, forkMessageID: sharedTip.id
+    )
+    ConversationStore.save(parent)
+    ConversationStore.save(child)
+    let resolved = ConversationStore.loadResolved(id: child.id)
+    print("forkResolved=\(resolved?.messages.count ?? -1) missingParent=\(resolved?.missingParent ?? true) tailOnDisk=\(ConversationStore.load(id: child.id)?.messages.count ?? -1)")
+    ConversationStore.deleteMaterializingChildren(id: parent.id)
+    let materialized = ConversationStore.load(id: child.id)
+    print("afterParentDelete standalone=\(materialized?.parentID == nil) messages=\(materialized?.messages.count ?? -1)")
+    ConversationStore.delete(id: child.id)
     exit(0)
 }
 
@@ -85,9 +107,67 @@ if let flagIndex = CommandLine.arguments.firstIndex(of: "--smoke-file"),
     RunLoop.main.run()
 }
 
-// UI layout stress (no network): builds the real panel — which auto-resumes the
-// most recent conversation — and bounces the transcript scroll while a watchdog
-// thread checks main-thread responsiveness. Catches layout-convergence hangs.
+/// Synthetic long-form conversation (prose/code/table/list/math) written into a
+/// scratch store, so UI harnesses are deterministic and never touch real history.
+func installBenchmarkConversation(minLength: Int) -> URL {
+    let scratch = FileManager.default.temporaryDirectory
+        .appendingPathComponent("popchat-bench-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+    ConversationStore.overrideDirectory = scratch
+    let block = """
+    ## Section heading
+
+    Some **bold** prose with `inline code`, a [link](https://example.com) and \
+    inline math $e^{i\\pi} + 1 = 0$ to exercise every render path.
+
+    ```swift
+    func fib(_ n: Int) -> Int { n < 2 ? n : fib(n - 1) + fib(n - 2) }
+    ```
+
+    | Column A | Column B |
+    |----------|----------|
+    | one      | two      |
+
+    - first item
+    - second item
+
+    $$\\sum_{k=1}^{n} k = \\frac{n(n+1)}{2}$$
+
+    """
+    var long = ""
+    while long.count < minLength { long += block }
+    ConversationStore.save(Conversation(
+        id: UUID(),
+        title: "ui benchmark",
+        updatedAt: Date(),
+        messages: [
+            ChatMessage(role: .user, text: "benchmark"),
+            ChatMessage(role: .assistant, text: long),
+        ]
+    ))
+    return scratch
+}
+
+/// The transcript scroller is the vertically-scrollable NSScrollView with the
+/// tallest document — a plain "first match" walk can land on a code block's
+/// horizontal scroller or an attachment strip.
+@MainActor
+func transcriptScrollView(in root: NSView?) -> NSScrollView? {
+    var best: NSScrollView?
+    func walk(_ view: NSView) {
+        if let scroll = view as? NSScrollView,
+           let doc = scroll.documentView,
+           doc.frame.height > (best?.documentView?.frame.height ?? 0) {
+            best = scroll
+        }
+        for sub in view.subviews { walk(sub) }
+    }
+    if let root { walk(root) }
+    return best
+}
+
+// UI layout stress (no network): builds the real panel with a synthetic long
+// conversation and bounces the transcript scroll while a watchdog thread checks
+// main-thread responsiveness. Catches layout-convergence hangs.
 if CommandLine.arguments.contains("--smoke-scroll") {
     nonisolated(unsafe) var lastPong = Date()
     nonisolated(unsafe) var maxPingLatency = 0.0
@@ -108,6 +188,7 @@ if CommandLine.arguments.contains("--smoke-scroll") {
         }
     }
     MainActor.assumeIsolated {
+        let scratch = installBenchmarkConversation(minLength: 20_000)
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
         let providerStore = ProviderStore()
@@ -115,21 +196,12 @@ if CommandLine.arguments.contains("--smoke-scroll") {
         let controller = PanelController(providerStore: providerStore, shortcutStore: shortcutStore)
         controller.show()
 
-        func findScrollView(_ view: NSView?) -> NSScrollView? {
-            guard let view else { return nil }
-            if let scroll = view as? NSScrollView { return scroll }
-            for sub in view.subviews {
-                if let found = findScrollView(sub) { return found }
-            }
-            return nil
-        }
-
         var elapsed = 0.0
         Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in
             MainActor.assumeIsolated {
                 elapsed += 0.05
                 guard let panel = app.windows.first(where: { $0 is FloatingPanel }),
-                      let scroll = findScrollView(panel.contentView),
+                      let scroll = transcriptScrollView(in: panel.contentView),
                       let doc = scroll.documentView else {
                     if elapsed > 3 { print("FAIL: no transcript scroll view found"); exit(1) }
                     return
@@ -144,6 +216,110 @@ if CommandLine.arguments.contains("--smoke-scroll") {
                 }
                 if elapsed >= 12 {
                     print(String(format: "PASS: 12s of scrolling, max main-thread ping latency %.0f ms", maxPingLatency * 1000))
+                    try? FileManager.default.removeItem(at: scratch)
+                    if maxY < 500 {
+                        print("FAIL: transcript content did not exceed the viewport — layout suspect")
+                        exit(1)
+                    }
+                    exit(0)
+                }
+            }
+        }
+        app.run()
+    }
+}
+
+// Typing responsiveness check: real panel + synthetic 20k-char conversation in a
+// scratch store, simulated edits in the real composer after warmup. Reports max
+// warmed main-thread stall and whether transcript measurements scale with
+// keystrokes. Fails (exit 3) on stalls above 50 ms.
+if CommandLine.arguments.contains("--smoke-typing") {
+    nonisolated(unsafe) var maxWarmStall = 0.0
+    nonisolated(unsafe) var warmed = false
+    nonisolated(unsafe) var warmStart = Date()
+    nonisolated(unsafe) var stallLog: [(Double, Double)] = [] // (s since warm, ms)
+    Thread.detachNewThread {
+        while true {
+            let sent = Date()
+            DispatchQueue.main.async {
+                let latency = Date().timeIntervalSince(sent)
+                if warmed {
+                    maxWarmStall = max(maxWarmStall, latency)
+                    if latency > 0.02 {
+                        stallLog.append((Date().timeIntervalSince(warmStart), latency * 1000))
+                    }
+                }
+            }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+    }
+    MainActor.assumeIsolated {
+        let scratch = installBenchmarkConversation(minLength: 20_000)
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        let providerStore = ProviderStore()
+        let shortcutStore = ShortcutStore()
+        let controller = PanelController(providerStore: providerStore, shortcutStore: shortcutStore)
+        controller.show()
+
+        func focusedEditor() -> NSTextView? {
+            guard let panel = app.windows.first(where: { $0 is FloatingPanel }) else { return nil }
+            if let editor = panel.firstResponder as? NSTextView { return editor }
+            func findField(_ view: NSView?) -> NSTextField? {
+                guard let view else { return nil }
+                if let field = view as? NSTextField, field.isEditable { return field }
+                for sub in view.subviews {
+                    if let found = findField(sub) { return found }
+                }
+                return nil
+            }
+            if let field = findField(panel.contentView) {
+                panel.makeFirstResponder(field)
+                return panel.firstResponder as? NSTextView
+            }
+            return nil
+        }
+
+        var elapsed = 0.0
+        var edits = 0
+        var measurementsAtWarm = 0
+        Timer.scheduledTimer(withTimeInterval: 0.03, repeats: true) { _ in
+            MainActor.assumeIsolated {
+                elapsed += 0.03
+                if elapsed < 2.0 { return } // cold construction + prewarm window
+                if !warmed {
+                    warmed = true
+                    warmStart = Date()
+                    measurementsAtWarm = SelectableText.measurementCount
+                    print("warmup done; measurements so far: \(measurementsAtWarm)")
+                }
+                guard let editor = focusedEditor() else {
+                    print("FAIL: no focused editor")
+                    try? FileManager.default.removeItem(at: scratch)
+                    exit(1)
+                }
+                if edits < 150 {
+                    // Alternate grow/shrink so height changes are exercised too.
+                    if edits % 10 == 9 {
+                        editor.deleteBackward(nil)
+                    } else {
+                        editor.insertText("a", replacementRange: NSRange(location: NSNotFound, length: 0))
+                    }
+                    edits += 1
+                } else {
+                    let typedMeasurements = SelectableText.measurementCount - measurementsAtWarm
+                    let stallMs = maxWarmStall * 1000
+                    print(String(format: "edits=%d transcript+composer measurements during typing=%d maxWarmedStall=%.1f ms",
+                                 edits, typedMeasurements, stallMs))
+                    for (at, ms) in stallLog.prefix(20) {
+                        print(String(format: "  stall %.0f ms at t=%.2fs", ms, at))
+                    }
+                    try? FileManager.default.removeItem(at: scratch)
+                    if stallMs > 50 {
+                        print("FAIL: warmed main-thread stall exceeded 50 ms")
+                        exit(3)
+                    }
+                    print("PASS")
                     exit(0)
                 }
             }

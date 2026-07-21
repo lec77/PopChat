@@ -61,6 +61,12 @@ struct HistoryPopover: View {
         } label: {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
+                    if meta.isFork {
+                        Image(systemName: "arrow.triangle.branch")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                            .help("Forked conversation")
+                    }
                     Text(meta.title)
                         .font(.system(size: 12.5, weight: isCurrent ? .semibold : .regular))
                         .lineLimit(1)

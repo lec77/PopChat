@@ -408,6 +408,23 @@ struct SelectableText: NSViewRepresentable {
     let attributed: NSAttributedString
     var wraps = true
 
+    /// Number of actual CoreText measurements performed (cache misses).
+    /// Read by the --smoke-typing harness; main-thread only.
+    nonisolated(unsafe) static var measurementCount = 0
+
+    /// Per-view measurement cache. Keyed by attributed-string IDENTITY (cheap;
+    /// finalized rows get the same cached instance from MarkdownRenderer, the
+    /// streaming row gets a fresh instance per tick and correctly misses) and
+    /// measured width. Layout probes each pass with a few proposals, so a small
+    /// per-width map is kept rather than a single last-value slot.
+    final class Coordinator {
+        var cachedAttributed: NSAttributedString?
+        var cachedWraps: Bool?
+        var sizes: [CGFloat: CGSize] = [:]
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
     func makeNSView(context: Context) -> NSTextField {
         let field = NSTextField(labelWithAttributedString: attributed)
         field.isSelectable = true
@@ -436,12 +453,24 @@ struct SelectableText: NSViewRepresentable {
         } else {
             maxWidth = .greatestFiniteMagnitude
         }
+        let coordinator = context.coordinator
+        if coordinator.cachedAttributed !== attributed || coordinator.cachedWraps != wraps {
+            coordinator.cachedAttributed = attributed
+            coordinator.cachedWraps = wraps
+            coordinator.sizes.removeAll()
+        }
+        if let cached = coordinator.sizes[maxWidth] {
+            return cached
+        }
+        Self.measurementCount += 1
         let bounds = attributed.boundingRect(
             with: NSSize(width: maxWidth, height: .greatestFiniteMagnitude),
             options: [.usesLineFragmentOrigin, .usesFontLeading]
         )
         let width = min(ceil(bounds.width) + 2, maxWidth)
-        return CGSize(width: width, height: ceil(bounds.height) + 2)
+        let size = CGSize(width: width, height: ceil(bounds.height) + 2)
+        coordinator.sizes[maxWidth] = size
+        return size
     }
 }
 

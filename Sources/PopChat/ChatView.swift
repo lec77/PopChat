@@ -238,7 +238,8 @@ struct ChatView: View {
                             MessageRow(
                                 message: message,
                                 showCaret: message.id == streamingID,
-                                bubbleMaxWidth: bubbleMaxWidth
+                                bubbleMaxWidth: bubbleMaxWidth,
+                                onFork: { store.fork(at: message.id) }
                             )
                             .equatable()
                             .transition(rowTransition(for: message.role))
@@ -382,10 +383,13 @@ private struct MessageRow: View, Equatable {
     let message: ChatMessage
     let showCaret: Bool
     let bubbleMaxWidth: CGFloat
+    /// Ignored by ==: it captures only stable references (store + message id).
+    var onFork: () -> Void = {}
 
     @AppStorage("bubbleStyle") private var bubbleStyleRaw = BubbleStyle.accentTint.rawValue
     @AppStorage("accentColor") private var accentHex = Theme.defaultAccentHex
     @Environment(\.colorScheme) private var scheme
+    @State private var copied = false
 
     static func == (lhs: MessageRow, rhs: MessageRow) -> Bool {
         lhs.message == rhs.message
@@ -424,8 +428,42 @@ private struct MessageRow: View, Equatable {
             }
             .frame(maxWidth: .infinity, alignment: .trailing)
         case .assistant:
-            AssistantMessageView(text: message.text, showCaret: showCaret)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: 4) {
+                AssistantMessageView(text: message.text, showCaret: showCaret)
+                // Always visible once the response is complete; occupies its
+                // space during streaming (opacity only) so finishing never
+                // reflows the transcript.
+                if !message.text.isEmpty {
+                    HStack(spacing: 12) {
+                        Button {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(message.text, forType: .string)
+                            copied = true
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { copied = false }
+                        } label: {
+                            Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
+                        }
+                        .help("Copy the whole response")
+                        Button(action: onFork) {
+                            Label("Fork", systemImage: "arrow.triangle.branch")
+                        }
+                        .help("Start a new conversation from this point")
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .labelStyle(.titleAndIcon)
+                    .opacity(showCaret ? 0 : 1)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contextMenu {
+                Button("Copy Message") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(message.text, forType: .string)
+                }
+                Button("Fork Here", action: onFork)
+            }
         case .activity:
             Label(message.text, systemImage: "sparkles")
                 .font(.system(size: 11))

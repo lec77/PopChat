@@ -54,7 +54,7 @@ final class PanelController: NSObject, NSWindowDelegate {
         panel.onAttachablePaste = {
             NotificationCenter.default.post(name: .popChatAttachPasteboard, object: nil)
         }
-        panel.contentView = NSHostingView(
+        let hostingView = NSHostingView(
             rootView: ChatView(
                 state: state,
                 store: chatStore,
@@ -64,6 +64,14 @@ final class PanelController: NSObject, NSWindowDelegate {
                 onCompactHeightChange: { [weak self] height in self?.compactHeightChanged(height) }
             )
         )
+        // CRITICAL for typing latency: with the default sizingOptions, every
+        // intrinsic-size invalidation from the multiline input field made
+        // AppKit re-ask the root for a fitting size, which re-measured the
+        // ENTIRE transcript (~8,700 CoreText measurements per keystroke).
+        // Window size is managed explicitly (setContentHeight/contentMinSize),
+        // so the hosting view must not propagate SwiftUI sizes to the window.
+        hostingView.sizingOptions = []
+        panel.contentView = hostingView
         panel.contentView?.wantsLayer = true // presentation animates this layer
         return panel
     }()

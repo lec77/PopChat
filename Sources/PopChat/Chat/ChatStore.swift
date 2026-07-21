@@ -26,6 +26,13 @@ final class ChatStore: ObservableObject {
     @Published private(set) var recent: [ConversationMeta] = []
     private(set) var conversationID = UUID()
 
+    // Fork state: `messages` always holds the full resolved transcript, but a
+    // forked conversation persists only its divergent tail — the first
+    // `sharedPrefixCount` messages belong to the parent chain.
+    private var forkParentID: UUID?
+    private var forkMessageID: UUID?
+    private var sharedPrefixCount = 0
+
     private let providerStore: ProviderStore
     private let shortcutStore: ShortcutStore
     private var streamTask: Task<Void, Never>?
@@ -43,9 +50,27 @@ final class ChatStore: ObservableObject {
         self.shortcutStore = shortcutStore
         // Resume the most recent conversation across app restarts.
         recent = ConversationStore.listRecent()
-        if let latest = recent.first, let conversation = ConversationStore.load(id: latest.id) {
-            conversationID = conversation.id
-            messages = conversation.messages
+        if let latest = recent.first, let loaded = ConversationStore.loadResolved(id: latest.id) {
+            adopt(loaded)
+        }
+    }
+
+    private func adopt(_ loaded: (conversation: Conversation, messages: [ChatMessage], missingParent: Bool)) {
+        conversationID = loaded.conversation.id
+        messages = loaded.messages
+        if loaded.missingParent {
+            // Broken chain: continue as a standalone conversation, and say so.
+            forkParentID = nil
+            forkMessageID = nil
+            sharedPrefixCount = 0
+            let notice = "This fork's parent conversation is missing — showing only the messages added after the fork."
+            if !messages.contains(where: { $0.role == .error && $0.text == notice }) {
+                messages.append(ChatMessage(role: .error, text: notice))
+            }
+        } else {
+            forkParentID = loaded.conversation.parentID
+            forkMessageID = loaded.conversation.forkMessageID
+            sharedPrefixCount = loaded.messages.count - loaded.conversation.messages.count
         }
     }
 
@@ -255,13 +280,40 @@ final class ChatStore: ObservableObject {
         }
     }
 
+    /// Start a new conversation that shares history up to and including
+    /// `messageID` — stored as a tree branch (parent pointer + divergent tail
+    /// only), so the shared prefix is never duplicated on disk.
+    func fork(at messageID: UUID) {
+        guard !isStreaming else { return }
+        guard let index = messages.firstIndex(where: { $0.id == messageID }) else { return }
+        persist() // parent must be current on disk before the branch points into it
+        forkParentID = conversationID
+        forkMessageID = messageID
+        conversationID = UUID()
+        sharedPrefixCount = index + 1
+        messages = Array(messages.prefix(index + 1))
+        messages.append(ChatMessage(
+            role: .activity,
+            text: "Forked here — this branch diverges from the original conversation."
+        ))
+        persist()
+    }
+
     func deleteConversation(_ id: UUID) {
-        ConversationStore.delete(id: id)
-        recent.removeAll { $0.id == id }
+        ConversationStore.deleteMaterializingChildren(id: id)
+        recent = ConversationStore.listRecent()
         if id == conversationID {
             stop()
             conversationID = UUID()
             messages.removeAll()
+            forkParentID = nil
+            forkMessageID = nil
+            sharedPrefixCount = 0
+        } else if forkParentID == id {
+            // Our file was just materialized as standalone; align memory with it.
+            forkParentID = nil
+            forkMessageID = nil
+            sharedPrefixCount = 0
         }
     }
 
@@ -270,23 +322,26 @@ final class ChatStore: ObservableObject {
         persist()
         conversationID = UUID()
         messages.removeAll()
+        forkParentID = nil
+        forkMessageID = nil
+        sharedPrefixCount = 0
     }
 
     func loadConversation(_ id: UUID) {
         guard id != conversationID else { return }
         stop()
         persist()
-        guard let conversation = ConversationStore.load(id: id) else {
+        guard let loaded = ConversationStore.loadResolved(id: id) else {
             recent.removeAll { $0.id == id }
             messages.append(ChatMessage(role: .error, text: "Couldn't load that conversation — its file is missing or corrupt."))
             return
         }
-        conversationID = conversation.id
-        messages = conversation.messages
+        adopt(loaded)
     }
 
-    /// Writes the current conversation to disk and refreshes its slot in the
-    /// recent list. No-op for empty conversations (avoids junk files).
+    /// Writes the current conversation to disk (a fork stores only its
+    /// divergent tail) and refreshes its slot in the recent list. No-op for
+    /// empty conversations (avoids junk files).
     private func persist() {
         guard !messages.isEmpty else { return }
         let title = Self.title(for: messages)
@@ -294,7 +349,9 @@ final class ChatStore: ObservableObject {
             id: conversationID,
             title: title,
             updatedAt: Date(),
-            messages: messages
+            messages: Array(messages.dropFirst(sharedPrefixCount)),
+            parentID: forkParentID,
+            forkMessageID: forkMessageID
         )
         ConversationStore.save(conversation)
         recent.removeAll { $0.id == conversationID }
@@ -302,7 +359,8 @@ final class ChatStore: ObservableObject {
             id: conversationID,
             title: title,
             updatedAt: conversation.updatedAt,
-            snippet: ConversationMeta.snippet(for: messages)
+            snippet: ConversationMeta.snippet(for: messages),
+            isFork: forkParentID != nil
         ), at: 0)
     }
 
