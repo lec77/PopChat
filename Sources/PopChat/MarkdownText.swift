@@ -555,6 +555,8 @@ struct CodeBlockView: View {
                     Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
                         .font(.system(size: 10.5))
                         .foregroundStyle(Color(nsColor: Theme.nsColor("#DFDFE6")).opacity(0.5))
+                        .padding(.vertical, 3)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
             }

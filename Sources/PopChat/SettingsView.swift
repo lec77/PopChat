@@ -167,6 +167,7 @@ struct SettingsView: View {
                                 .strokeBorder(Theme.color(hex), lineWidth: 2)
                                 .opacity(selected ? 1 : 0)
                         )
+                        .contentShape(Circle())
                 }
                 .buttonStyle(.plain)
                 .help(hex)

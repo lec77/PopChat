@@ -174,6 +174,9 @@ struct ChatView: View {
             .foregroundStyle(.secondary)
             .padding(.horizontal, 11)
             .padding(.vertical, 6)
+            // Whole pill is clickable — plain-style controls only hit-test
+            // opaque pixels without an explicit content shape.
+            .contentShape(Capsule())
         }
         .menuStyle(.button)
         .buttonStyle(.plain)
@@ -191,6 +194,7 @@ struct ChatView: View {
                     .font(.system(size: 14))
                     .frame(width: 24, height: 24)
                     .background(historyShown ? Color.primary.opacity(0.14) : .clear, in: Circle())
+                    .contentShape(Circle())
             }
             .buttonStyle(.plain)
             .help("Recent chats")
@@ -203,6 +207,7 @@ struct ChatView: View {
                 Image(systemName: "square.and.pencil")
                     .font(.system(size: 14))
                     .frame(width: 24, height: 24)
+                    .contentShape(Circle())
             }
             .buttonStyle(.plain)
             .keyboardShortcut("n", modifiers: .command)
@@ -215,6 +220,7 @@ struct ChatView: View {
                     .contentTransition(.symbolEffect(.replace))
                     .frame(width: 24, height: 24)
                     .background(state.pinned ? Color.primary.opacity(0.14) : .clear, in: Circle())
+                    .contentShape(Circle())
             }
             .buttonStyle(.plain)
             .help(state.pinned ? "Unpin — hide when clicking away" : "Keep on top")
@@ -454,10 +460,14 @@ private struct MessageRow: View, Equatable {
                             DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { copied = false }
                         } label: {
                             Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
+                                .padding(.vertical, 2)
+                                .contentShape(Rectangle())
                         }
                         .help("Copy the whole response")
                         Button(action: onFork) {
                             Label("Fork", systemImage: "arrow.triangle.branch")
+                                .padding(.vertical, 2)
+                                .contentShape(Rectangle())
                         }
                         .help("Start a new conversation from this point")
                     }

@@ -78,6 +78,8 @@ struct HistoryPopover: View {
                             Image(systemName: "trash")
                                 .font(.system(size: 10))
                                 .foregroundStyle(.secondary)
+                                .frame(width: 20, height: 20)
+                                .contentShape(Circle())
                         }
                         .buttonStyle(.plain)
                         .keyboardShortcut(.delete, modifiers: .command)

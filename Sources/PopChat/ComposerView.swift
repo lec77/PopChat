@@ -290,6 +290,8 @@ struct ComposerView: View {
                     Image(systemName: "paperclip")
                         .font(.system(size: 16))
                         .foregroundStyle(.secondary)
+                        .frame(width: 24, height: 24)
+                        .contentShape(Circle())
                 }
                 .help("Attach files (or drag & drop, or paste)")
                 Button {
@@ -298,13 +300,14 @@ struct ComposerView: View {
                     Image(systemName: "globe")
                         .font(.system(size: 16))
                         .foregroundStyle(webEnabled ? accent : Color.secondary)
+                        .frame(width: 24, height: 24)
+                        .contentShape(Circle())
                 }
                 .help(webEnabled ? "Web access on — model may search and read pages" : "Web access off")
             }
-            .padding(.bottom, 3)
             composerField(fillsHeight: false)
                 .frame(height: inputHeight)
-                .padding(.vertical, 3)
+                .padding(.vertical, 5)
             Group {
                 Button {
                     editorMode = true
@@ -312,12 +315,13 @@ struct ComposerView: View {
                     Image(systemName: "arrow.up.left.and.arrow.down.right")
                         .font(.system(size: 13))
                         .foregroundStyle(.secondary)
+                        .frame(width: 24, height: 24)
+                        .contentShape(Circle())
                 }
                 .keyboardShortcut("e", modifiers: .command)
                 .help("Expand editor (⌘E)")
                 sendOrStopButton(size: 26)
             }
-            .padding(.bottom, 1)
         }
         .buttonStyle(.plain)
         .padding(.horizontal, 14)
@@ -340,6 +344,8 @@ struct ComposerView: View {
                     Image(systemName: "xmark.circle.fill")
                         .font(.system(size: 16))
                         .foregroundStyle(.secondary)
+                        .frame(width: 22, height: 22)
+                        .contentShape(Circle())
                 }
                 .buttonStyle(.plain)
                 .help("Close editor (Esc)")
@@ -356,6 +362,8 @@ struct ComposerView: View {
                     Image(systemName: "paperclip")
                         .font(.system(size: 16))
                         .foregroundStyle(.secondary)
+                        .frame(width: 24, height: 24)
+                        .contentShape(Circle())
                 }
                 .help("Attach files")
                 Button {
@@ -364,6 +372,8 @@ struct ComposerView: View {
                     Image(systemName: "globe")
                         .font(.system(size: 16))
                         .foregroundStyle(webEnabled ? accent : Color.secondary)
+                        .frame(width: 24, height: 24)
+                        .contentShape(Circle())
                 }
                 .help(webEnabled ? "Web access on" : "Web access off")
                 Spacer()
@@ -435,6 +445,8 @@ struct ComposerView: View {
                 Image(systemName: "stop.circle.fill")
                     .font(.system(size: size))
                     .foregroundStyle(Theme.stopRed)
+                    .frame(width: size + 4, height: size + 4)
+                    .contentShape(Circle())
             }
             .help("Stop generating")
         } else {
@@ -442,6 +454,8 @@ struct ComposerView: View {
                 Image(systemName: "arrow.up.circle.fill")
                     .font(.system(size: size))
                     .foregroundStyle(canSend ? accent : Color.primary.opacity(0.25))
+                    .frame(width: size + 4, height: size + 4)
+                    .contentShape(Circle())
             }
             .disabled(!canSend)
             if let sendShortcut {
@@ -590,6 +604,8 @@ private struct AttachmentChip: View {
                     Image(systemName: attachment.noteKind == .warning ? "exclamationmark.triangle.fill" : "info.circle")
                         .font(.system(size: 10))
                         .foregroundStyle(attachment.noteKind == .warning ? Theme.warningOrange : Color.secondary)
+                        .frame(width: 18, height: 18)
+                        .contentShape(Circle())
                 }
                 .buttonStyle(.plain)
                 .help(note)
@@ -605,6 +621,8 @@ private struct AttachmentChip: View {
                 Image(systemName: "xmark.circle.fill")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
+                    .frame(width: 18, height: 18)
+                    .contentShape(Circle())
             }
             .buttonStyle(.plain)
             .help("Remove attachment")
