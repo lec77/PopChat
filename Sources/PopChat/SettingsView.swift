@@ -57,6 +57,8 @@ struct SettingsView: View {
     // Bumped on every sign-in/cancel so a stale attempt can't clobber the shared
     // UI state of a newer one (cancel-then-reclick race).
     @State private var chatGPTSignInGeneration = 0
+    /// Custom provider awaiting delete confirmation (removal drops its API key).
+    @State private var providerPendingDeletion: UUID?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -264,12 +266,24 @@ struct SettingsView: View {
     private var providersTab: some View {
         Form {
             Section {
-                Picker("Provider", selection: $store.selectedID) {
-                    ForEach(store.providers) { provider in
-                        Text(provider.name).tag(provider.id)
+                providerList
+                HStack {
+                    Button {
+                        store.addCustom()
+                    } label: {
+                        Label("Add Custom Provider", systemImage: "plus")
                     }
+                    Spacer()
                 }
+            } header: {
+                Text("Providers")
+            } footer: {
+                Text("Presets stay; providers you add can be renamed and removed.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
 
+            Section {
                 if let index = store.providers.firstIndex(where: { $0.id == store.selectedID }) {
                     if store.providers[index].kind == .chatGPT {
                         chatGPTAuthRows
@@ -291,13 +305,8 @@ struct SettingsView: View {
                             .foregroundStyle(.red)
                     }
                 }
-
-                HStack {
-                    Button("Add Custom Provider") { store.addCustom() }
-                    if store.selectedProvider?.isPreset == false {
-                        Button("Remove", role: .destructive) { store.removeSelected() }
-                    }
-                }
+            } header: {
+                Text(store.selectedProvider?.name ?? "Provider")
             } footer: {
                 Text("Keys are stored locally in Application Support, never synced.")
                     .font(.caption)
@@ -305,6 +314,77 @@ struct SettingsView: View {
                     .help("~/Library/Application Support/PopChat/secrets.json, user-only permissions.")
             }
         }
+        .confirmationDialog(
+            "Remove “\(store.providers.first { $0.id == providerPendingDeletion }?.name ?? "")”?",
+            isPresented: Binding(get: { providerPendingDeletion != nil }, set: { if !$0 { providerPendingDeletion = nil } }),
+            titleVisibility: .visible
+        ) {
+            Button("Remove Provider", role: .destructive) {
+                if let id = providerPendingDeletion { store.remove(id) }
+                providerPendingDeletion = nil
+            }
+            Button("Cancel", role: .cancel) { providerPendingDeletion = nil }
+        } message: {
+            Text("Its API key and fetched model list are deleted too.")
+        }
+    }
+
+    /// Every provider, preset and added, in one list — the switcher only shows the
+    /// configured ones, so this is the single place an added provider is visible
+    /// (and the only place it can be deleted).
+    private var providerList: some View {
+        VStack(spacing: 0) {
+            ForEach(Array(store.providers.enumerated()), id: \.element.id) { offset, provider in
+                if offset > 0 {
+                    Divider().opacity(0.5)
+                }
+                providerRow(provider)
+            }
+        }
+        .padding(.vertical, -2)
+    }
+
+    private func providerRow(_ provider: Provider) -> some View {
+        let selected = provider.id == store.selectedID
+        return HStack(spacing: 8) {
+            Image(systemName: selected ? "largecircle.fill.circle" : "circle")
+                .font(.system(size: 12))
+                .foregroundStyle(selected ? Color.accentColor : Color.secondary.opacity(0.55))
+            VStack(alignment: .leading, spacing: 1) {
+                Text(provider.name)
+                Text(providerSubtitle(provider))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer(minLength: 8)
+            if !provider.isPreset {
+                Button {
+                    providerPendingDeletion = provider.id
+                } label: {
+                    Image(systemName: "trash")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 22, height: 22)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .help("Remove this provider")
+            }
+        }
+        .padding(.vertical, 5)
+        .contentShape(Rectangle())
+        .onTapGesture { store.selectedID = provider.id }
+    }
+
+    private func providerSubtitle(_ provider: Provider) -> String {
+        if provider.kind == .chatGPT {
+            _ = chatGPTAuthTick // re-read the row when sign-in state changes
+            return ChatGPTAuth.isSignedIn ? "Signed in · your ChatGPT plan" : "Not signed in"
+        }
+        if provider.baseURL.isEmpty { return "No base URL yet" }
+        return provider.baseURL
     }
 
     /// Sign-in UI for the ChatGPT provider — replaces the Base URL/API key fields.

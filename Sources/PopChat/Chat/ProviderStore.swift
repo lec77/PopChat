@@ -94,7 +94,7 @@ final class ProviderStore: ObservableObject {
         var migrated = providers
         // Provider lists saved before the ChatGPT preset existed: add it once.
         if !migrated.contains(where: { $0.kind == .chatGPT }) {
-            if let index = migrated.firstIndex(where: { $0.isPreset && $0.name == Self.chatGPTProviderName }) {
+            if let index = migrated.firstIndex(where: { $0.isPreset && Self.chatGPTProviderNames.contains($0.name) }) {
                 // A round-trip through an older build strips the `kind` field; heal
                 // that entry in place instead of inserting a second, undeletable one.
                 // Require isPreset so a user's custom provider that merely happens to
@@ -105,6 +105,14 @@ final class ProviderStore: ObservableObject {
             } else {
                 migrated.insert(Self.chatGPTPreset(), at: min(1, migrated.count))
             }
+        }
+        // Renamed 2026-07-21: the preset says what it IS (your subscription), not
+        // which app's OAuth flow it borrows. Rename in place so the stored id —
+        // and with it the selection, model list and secrets — survives.
+        for index in migrated.indices
+        where migrated[index].isPreset && migrated[index].kind == .chatGPT
+            && migrated[index].name == Self.legacyChatGPTProviderName {
+            migrated[index].name = Self.chatGPTProviderName
         }
 
         self.providers = migrated
@@ -125,7 +133,10 @@ final class ProviderStore: ObservableObject {
         }
     }
 
-    static let chatGPTProviderName = "OpenAI (ChatGPT)"
+    static let chatGPTProviderName = "OpenAI (subscription)"
+    /// Name shipped before 2026-07-21; still recognized when healing old lists.
+    static let legacyChatGPTProviderName = "OpenAI (ChatGPT)"
+    static var chatGPTProviderNames: [String] { [chatGPTProviderName, legacyChatGPTProviderName] }
 
     static func chatGPTPreset() -> Provider {
         Provider(
@@ -202,20 +213,38 @@ final class ProviderStore: ObservableObject {
 
     // MARK: - Custom providers
 
-    func addCustom() {
-        let provider = Provider(id: UUID(), name: "Custom", baseURL: "", isPreset: false, defaultModel: "")
+    @discardableResult
+    func addCustom() -> UUID {
+        // Distinct names: several blank "Custom" rows are indistinguishable in the
+        // switcher and in Settings' list.
+        var name = "Custom"
+        var suffix = 2
+        while providers.contains(where: { $0.name == name }) {
+            name = "Custom \(suffix)"
+            suffix += 1
+        }
+        let provider = Provider(id: UUID(), name: name, baseURL: "", isPreset: false, defaultModel: "")
         providers.append(provider)
         selectedID = provider.id
+        return provider.id
     }
 
-    func removeSelected() {
+    /// Deletes a custom provider (presets stay). Drops its key and cached model
+    /// state too — the id is gone, so those entries could never be reached again.
+    func remove(_ id: UUID) {
         guard providers.count > 1,
-              let index = providers.firstIndex(where: { $0.id == selectedID }),
+              let index = providers.firstIndex(where: { $0.id == id }),
               !providers[index].isPreset else { return }
-        SecretStore.delete(account: selectedID.uuidString)
+        SecretStore.delete(account: id.uuidString)
+        knownModels[id] = nil
+        selectedModels[id] = nil
         providers.remove(at: index)
-        selectedID = providers[0].id
+        if selectedID == id {
+            selectedID = providers[0].id
+        }
     }
+
+    func removeSelected() { remove(selectedID) }
 
     // MARK: - Model list
 
