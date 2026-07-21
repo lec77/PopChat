@@ -10,6 +10,7 @@ struct ProviderConfig {
     var baseURL: String
     var apiKey: String
     var model: String
+    var kind: ProviderKind = .openAICompatible
 }
 
 /// Streaming events, pi-ai style: every `partial` carries the full accumulated text so

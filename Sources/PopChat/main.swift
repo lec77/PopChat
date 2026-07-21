@@ -62,6 +62,60 @@ if smokePlain || smokeSearch || smokePasteable {
     RunLoop.main.run()
 }
 
+// ChatGPT-subscription auth + streaming checks (no UI):
+//   .build/debug/PopChat --chatgpt-login    interactive: opens the browser OAuth flow
+//   .build/debug/PopChat --smoke-chatgpt    requires a prior login; one streaming turn
+if CommandLine.arguments.contains("--chatgpt-login") {
+    Task { @MainActor in
+        do {
+            try await ChatGPTAuth.signIn()
+            print("signed in: \(ChatGPTAuth.accountEmail ?? "?") plan=\(ChatGPTAuth.planLabel ?? "?")")
+            exit(0)
+        } catch {
+            print("LOGIN-ERROR: \(error.localizedDescription)")
+            exit(1)
+        }
+    }
+    RunLoop.main.run()
+}
+if CommandLine.arguments.contains("--smoke-chatgpt") {
+    Task {
+        guard ChatGPTAuth.isSignedIn else {
+            print("SKIP: not signed in — run --chatgpt-login first")
+            exit(1)
+        }
+        let model = ProcessInfo.processInfo.environment["POPCHAT_MODEL"] ?? ChatGPTAuth.defaultModel
+        let config = ProviderConfig(baseURL: "", apiKey: "", model: model, kind: .chatGPT)
+        let useSearch = CommandLine.arguments.contains("--with-search")
+        print("smoke-chatgpt: model=\(model) account=\(ChatGPTAuth.accountEmail ?? "?") search=\(useSearch)")
+        let prompt = useSearch
+            ? "What is the latest stable release version of the Zed editor? Use web_search to check — do not answer from memory. Reply with just the version number and the source URL."
+            : "Reply with exactly: PopChat ChatGPT OK"
+        var chunks = 0
+        let history = [OpenAIChatClient.WireMessage(role: "user", content: .text(prompt))]
+        for await event in CodexResponsesClient.run(
+            history: history,
+            config: config,
+            webAccess: useSearch ? .localTools(.duckduckgo) : nil
+        ) {
+            switch event {
+            case .partial:
+                chunks += 1
+            case .activity(let text):
+                print("[activity] \(text)")
+            case .done(let text):
+                print("chunks=\(chunks)\nfinal=\(text)")
+                exit(text.isEmpty ? 1 : 0)
+            case .error(let message):
+                print("ERROR: \(message)")
+                exit(1)
+            }
+        }
+        exit(1)
+    }
+    RunLoop.main.run()
+}
+
 // Conversation persistence round-trip check (no network, no UI).
 if CommandLine.arguments.contains("--smoke-persist") {
     let conversation = Conversation(

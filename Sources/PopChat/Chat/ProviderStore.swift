@@ -1,5 +1,13 @@
 import Foundation
 
+/// How PopChat talks to a provider. Almost everything is OpenAI-compatible chat
+/// completions with an API key; the ChatGPT kind instead uses OAuth tokens from
+/// "Sign in with ChatGPT" against the Codex Responses backend.
+enum ProviderKind: String, Codable {
+    case openAICompatible
+    case chatGPT
+}
+
 /// A provider is an identity — base URL + display name. API keys live in the local
 /// secrets file keyed by provider id; the wire protocol is always OpenAI-compatible
 /// chat completions.
@@ -9,6 +17,27 @@ struct Provider: Identifiable, Codable, Equatable {
     var baseURL: String
     var isPreset: Bool
     var defaultModel: String
+    var kind: ProviderKind
+
+    init(id: UUID, name: String, baseURL: String, isPreset: Bool, defaultModel: String, kind: ProviderKind = .openAICompatible) {
+        self.id = id
+        self.name = name
+        self.baseURL = baseURL
+        self.isPreset = isPreset
+        self.defaultModel = defaultModel
+        self.kind = kind
+    }
+
+    // Provider lists persisted before the ChatGPT kind existed have no `kind` field.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        baseURL = try container.decode(String.self, forKey: .baseURL)
+        isPreset = try container.decode(Bool.self, forKey: .isPreset)
+        defaultModel = try container.decode(String.self, forKey: .defaultModel)
+        kind = try container.decodeIfPresent(ProviderKind.self, forKey: .kind) ?? .openAICompatible
+    }
 }
 
 @MainActor
@@ -52,8 +81,14 @@ final class ProviderStore: ObservableObject {
             d.removeObject(forKey: key)
         }
 
-        self.providers = providers
-        self.selectedID = selectedID ?? providers[0].id
+        var migrated = providers
+        // Provider lists saved before the ChatGPT preset existed: add it once.
+        if !migrated.contains(where: { $0.kind == .chatGPT }) {
+            migrated.insert(Self.chatGPTPreset(), at: min(1, migrated.count))
+        }
+
+        self.providers = migrated
+        self.selectedID = selectedID ?? migrated[0].id
         self.knownModels = Self.loadJSON([UUID: [String]].self, key: Keys.knownModels) ?? [:]
         self.selectedModels = selectedModels
         // didSet does not fire during init — persist the seeded/migrated state explicitly.
@@ -61,9 +96,21 @@ final class ProviderStore: ObservableObject {
         persistJSON(self.selectedModels, key: Keys.selectedModels)
     }
 
+    static func chatGPTPreset() -> Provider {
+        Provider(
+            id: UUID(),
+            name: "OpenAI (ChatGPT)",
+            baseURL: "",
+            isPreset: true,
+            defaultModel: ChatGPTAuth.defaultModel,
+            kind: .chatGPT
+        )
+    }
+
     static func presets() -> [Provider] {
         [
             Provider(id: UUID(), name: "DeepSeek", baseURL: "https://api.deepseek.com", isPreset: true, defaultModel: "deepseek-chat"),
+            chatGPTPreset(),
             Provider(id: UUID(), name: "OpenAI", baseURL: "https://api.openai.com/v1", isPreset: true, defaultModel: "gpt-4o"),
             Provider(id: UUID(), name: "OpenRouter", baseURL: "https://openrouter.ai/api/v1", isPreset: true, defaultModel: "openrouter/auto"),
             Provider(id: UUID(), name: "Ollama (local)", baseURL: "http://localhost:11434/v1", isPreset: true, defaultModel: ""),
@@ -82,7 +129,10 @@ final class ProviderStore: ObservableObject {
     /// servers). The active provider is always included. Settings shows all.
     var configuredProviders: [Provider] {
         providers.filter { provider in
-            provider.id == selectedID
+            if provider.kind == .chatGPT {
+                return provider.id == selectedID || ChatGPTAuth.isSignedIn
+            }
+            return provider.id == selectedID
                 || !(SecretStore.get(account: provider.id.uuidString) ?? "").isEmpty
                 || !(knownModels[provider.id] ?? []).isEmpty
                 || selectedModels[provider.id] != nil
@@ -108,7 +158,7 @@ final class ProviderStore: ObservableObject {
 
     func currentConfig() -> ProviderConfig? {
         guard let provider = selectedProvider else { return nil }
-        return ProviderConfig(baseURL: provider.baseURL, apiKey: currentKey(), model: currentModel)
+        return ProviderConfig(baseURL: provider.baseURL, apiKey: currentKey(), model: currentModel, kind: provider.kind)
     }
 
     // MARK: - Custom providers
@@ -137,6 +187,12 @@ final class ProviderStore: ObservableObject {
 
     func fetchModels() async {
         guard let provider = selectedProvider else { return }
+        // The ChatGPT backend has no /models endpoint — the catalog is fixed.
+        if provider.kind == .chatGPT {
+            knownModels[provider.id] = ChatGPTAuth.modelCatalog
+            modelFetchError = nil
+            return
+        }
         isFetchingModels = true
         modelFetchError = nil
         defer { isFetchingModels = false }

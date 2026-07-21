@@ -145,14 +145,25 @@ final class ChatStore: ObservableObject {
             persist()
             return
         }
-        let isLocal = config.baseURL.contains("localhost") || config.baseURL.contains("127.0.0.1")
-        if config.apiKey.isEmpty && !isLocal {
-            messages.append(ChatMessage(
-                role: .error,
-                text: "No API key for \(providerName). Add one via right-click on the menu bar icon → Settings…"
-            ))
-            persist()
-            return
+        if config.kind == .chatGPT {
+            if !ChatGPTAuth.isSignedIn {
+                messages.append(ChatMessage(
+                    role: .error,
+                    text: "Not signed in to ChatGPT. Right-click the menu bar icon → Settings… → Providers → Sign in with ChatGPT."
+                ))
+                persist()
+                return
+            }
+        } else {
+            let isLocal = config.baseURL.contains("localhost") || config.baseURL.contains("127.0.0.1")
+            if config.apiKey.isEmpty && !isLocal {
+                messages.append(ChatMessage(
+                    role: .error,
+                    text: "No API key for \(providerName). Add one via right-click on the menu bar icon → Settings…"
+                ))
+                persist()
+                return
+            }
         }
 
         let webAccess = resolveWebAccess(providerBaseURL: config.baseURL)
@@ -176,10 +187,18 @@ final class ChatStore: ObservableObject {
         streamFinished = false
         streamingMessageID = assistantMessage.id
 
+        // Same event stream either way — only the wire protocol differs.
+        let stream = config.kind == .chatGPT
+            ? CodexResponsesClient.run(
+                history: history, config: config, webAccess: webAccess,
+                sessionID: conversationID.uuidString.lowercased()
+            )
+            : OpenAIChatClient.run(history: history, config: config, webAccess: webAccess)
+
         streamTask = Task {
             // The streaming assistant row stays last; activity rows are inserted above it.
             var assistantIndex = messages.count - 1
-            for await event in OpenAIChatClient.run(history: history, config: config, webAccess: webAccess) {
+            for await event in stream {
                 switch event {
                 case .partial(let text), .done(let text):
                     streamTarget = text

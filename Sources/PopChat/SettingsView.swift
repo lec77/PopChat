@@ -47,6 +47,12 @@ struct SettingsView: View {
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @State private var loginItemError: String?
 
+    // ChatGPT sign-in state. Auth itself lives in ChatGPTAuth (SecretStore-backed);
+    // `chatGPTAuthTick` just forces re-render after sign-in/out completes.
+    @State private var chatGPTSignInTask: Task<Void, Never>?
+    @State private var chatGPTAuthError: String?
+    @State private var chatGPTAuthTick = false
+
     var body: some View {
         VStack(spacing: 0) {
             tabBar
@@ -242,15 +248,19 @@ struct SettingsView: View {
                 }
 
                 if let index = store.providers.firstIndex(where: { $0.id == store.selectedID }) {
-                    if !store.providers[index].isPreset {
-                        TextField("Name", text: $store.providers[index].name)
-                    }
-                    TextField("Base URL", text: $store.providers[index].baseURL)
-                        .help("Include /v1 where the provider requires it; local servers (Ollama, LM Studio) need no key.")
-                    SecureField("API Key", text: $apiKeyDraft)
-                        .onChange(of: apiKeyDraft) { _, newValue in
-                            store.setKey(newValue)
+                    if store.providers[index].kind == .chatGPT {
+                        chatGPTAuthRows
+                    } else {
+                        if !store.providers[index].isPreset {
+                            TextField("Name", text: $store.providers[index].name)
                         }
+                        TextField("Base URL", text: $store.providers[index].baseURL)
+                            .help("Include /v1 where the provider requires it; local servers (Ollama, LM Studio) need no key.")
+                        SecureField("API Key", text: $apiKeyDraft)
+                            .onChange(of: apiKeyDraft) { _, newValue in
+                                store.setKey(newValue)
+                            }
+                    }
                     modelRow
                     if let error = store.modelFetchError {
                         Label(error, systemImage: "exclamationmark.triangle.fill")
@@ -271,6 +281,78 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
                     .help("~/Library/Application Support/PopChat/secrets.json, user-only permissions.")
             }
+        }
+    }
+
+    /// Sign-in UI for the ChatGPT provider — replaces the Base URL/API key fields.
+    /// Uses your ChatGPT Plus/Pro subscription via the same OAuth flow as Codex CLI.
+    @ViewBuilder
+    private var chatGPTAuthRows: some View {
+        let _ = chatGPTAuthTick // re-evaluate when sign-in state changes
+        if ChatGPTAuth.isSignedIn {
+            HStack {
+                Label {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Signed in with ChatGPT")
+                        let detail = [ChatGPTAuth.accountEmail, ChatGPTAuth.planLabel]
+                            .compactMap { $0 }.joined(separator: " · ")
+                        if !detail.isEmpty {
+                            Text(detail)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                } icon: {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                }
+                Spacer()
+                Button("Sign Out", role: .destructive) {
+                    ChatGPTAuth.signOut()
+                    chatGPTAuthTick.toggle()
+                }
+            }
+        } else if chatGPTSignInTask != nil {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Waiting for the browser sign-in…")
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Cancel") {
+                    chatGPTSignInTask?.cancel()
+                    chatGPTSignInTask = nil
+                }
+            }
+        } else {
+            HStack {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Use your ChatGPT subscription")
+                    Text("Opens chatgpt.com to authorize. Works with Plus/Pro; usage counts against your plan's limits.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Sign in with ChatGPT") {
+                    chatGPTAuthError = nil
+                    chatGPTSignInTask = Task {
+                        do {
+                            try await ChatGPTAuth.signIn()
+                        } catch is CancellationError {
+                            // user cancelled — no error row
+                        } catch {
+                            chatGPTAuthError = error.localizedDescription
+                        }
+                        chatGPTSignInTask = nil
+                        chatGPTAuthTick.toggle()
+                        await store.fetchModels()
+                    }
+                }
+            }
+        }
+        if let error = chatGPTAuthError {
+            Label(error, systemImage: "exclamationmark.triangle.fill")
+                .font(.caption)
+                .foregroundStyle(.red)
         }
     }
 
