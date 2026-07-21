@@ -97,6 +97,14 @@ enum CodexResponsesClient {
 
             visible = outcome.visibleText
 
+            // A truncated response terminates the turn with a visible warning,
+            // regardless of any partial tool calls it may have carried.
+            if let reason = outcome.incompleteReason {
+                continuation.yield(.error(truncationMessage(reason: reason)))
+                continuation.yield(.done(visible))
+                return
+            }
+
             guard let executor, !outcome.toolCalls.isEmpty, !roundsExhausted else {
                 continuation.yield(.done(visible))
                 return
@@ -165,6 +173,9 @@ enum CodexResponsesClient {
         /// calls and any reasoning items the backend requires to stay paired).
         var roundItems: [[String: Any]]
         var toolCalls: [ToolCall]
+        /// Set when the backend ended the response with `response.incomplete`
+        /// (output-token limit, content filter, …) — the answer is truncated.
+        var incompleteReason: String? = nil
     }
 
     private static func streamOneRound(
@@ -298,8 +309,15 @@ enum CodexResponsesClient {
                     roundItems.append(item)
                 }
 
-            case "response.completed", "response.incomplete", "response.done":
+            case "response.completed", "response.done":
                 return RoundOutcome(visibleText: visible, roundItems: roundItems, toolCalls: toolCalls)
+
+            case "response.incomplete":
+                // Truncated (output limit / content filter) — carry the reason out
+                // so the loop can surface a visible warning instead of presenting a
+                // cut-off answer as complete.
+                let reason = ((event["response"] as? [String: Any])?["incomplete_details"] as? [String: Any])?["reason"] as? String
+                return RoundOutcome(visibleText: visible, roundItems: roundItems, toolCalls: toolCalls, incompleteReason: reason ?? "unknown")
 
             case "response.failed":
                 let error = (event["response"] as? [String: Any])?["error"] as? [String: Any]
@@ -316,6 +334,17 @@ enum CodexResponsesClient {
         }
         // Stream ended without a terminal event — keep whatever arrived.
         return RoundOutcome(visibleText: visible, roundItems: roundItems, toolCalls: toolCalls)
+    }
+
+    private static func truncationMessage(reason: String?) -> String {
+        switch reason {
+        case "max_output_tokens":
+            return "⚠︎ Response was cut off at the model's output limit — it may be incomplete."
+        case "content_filter":
+            return "⚠︎ Response was stopped by a content filter — it may be incomplete."
+        default:
+            return "⚠︎ Response ended early and may be incomplete\(reason.map { " (\($0))" } ?? "")."
+        }
     }
 
     private static func errorText(code: Any?, message: Any?) -> String? {

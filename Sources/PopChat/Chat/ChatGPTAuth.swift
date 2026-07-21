@@ -353,11 +353,12 @@ enum ChatGPTAuth {
                 "client_id": clientID,
             ])
         } catch let error as AuthError {
-            // A 4xx from the token endpoint means the refresh token itself is bad
-            // (revoked/expired) — clear the session so the UI offers Sign in again
-            // instead of a dead end (green "Signed in" + every send saying "sign in").
-            // Transient/network errors keep the tokens so a later retry can succeed.
-            if let code = error.statusCode, (400..<500).contains(code) {
+            // Only clear the session when the refresh grant itself is invalid:
+            // the OAuth token endpoint signals that with 400 (invalid_grant) or
+            // 401. Transient failures — 429 rate limits, 5xx, network errors —
+            // keep the tokens so a later retry can succeed rather than forcing a
+            // full browser re-sign-in.
+            if let code = error.statusCode, code == 400 || code == 401 {
                 await MainActor.run { signOut() }
             }
             throw AuthError(message: "ChatGPT session expired and refresh failed (\(error.message)). Sign in again in Settings → Providers.")

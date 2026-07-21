@@ -94,9 +94,11 @@ final class ProviderStore: ObservableObject {
         var migrated = providers
         // Provider lists saved before the ChatGPT preset existed: add it once.
         if !migrated.contains(where: { $0.kind == .chatGPT }) {
-            if let index = migrated.firstIndex(where: { $0.name == Self.chatGPTProviderName }) {
+            if let index = migrated.firstIndex(where: { $0.isPreset && $0.name == Self.chatGPTProviderName }) {
                 // A round-trip through an older build strips the `kind` field; heal
                 // that entry in place instead of inserting a second, undeletable one.
+                // Require isPreset so a user's custom provider that merely happens to
+                // share the name isn't erased and switched to ChatGPT OAuth.
                 migrated[index].kind = .chatGPT
                 migrated[index].baseURL = ""
                 migrated[index].defaultModel = ChatGPTAuth.defaultModel
