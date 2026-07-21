@@ -9,8 +9,9 @@ enum ProviderKind: String, Codable {
 }
 
 /// A provider is an identity — base URL + display name. API keys live in the local
-/// secrets file keyed by provider id; the wire protocol is always OpenAI-compatible
-/// chat completions.
+/// secrets file keyed by provider id. The wire protocol is OpenAI-compatible chat
+/// completions for every `kind` except `.chatGPT`, which uses the Codex Responses
+/// backend via `CodexResponsesClient` (see `kind`).
 struct Provider: Identifiable, Codable, Equatable {
     var id: UUID
     var name: String
@@ -36,7 +37,13 @@ struct Provider: Identifiable, Codable, Equatable {
         baseURL = try container.decode(String.self, forKey: .baseURL)
         isPreset = try container.decode(Bool.self, forKey: .isPreset)
         defaultModel = try container.decode(String.self, forKey: .defaultModel)
-        kind = try container.decodeIfPresent(ProviderKind.self, forKey: .kind) ?? .openAICompatible
+        // Decode via the raw string and map unknown values to .openAICompatible
+        // rather than decoding the enum directly, which would THROW on an
+        // unrecognized case and fail the whole [Provider] decode — silently
+        // resetting every provider (and orphaning their per-UUID secrets/models)
+        // the first time a newer build's provider kind is seen by this build.
+        let rawKind = try container.decodeIfPresent(String.self, forKey: .kind)
+        kind = rawKind.flatMap(ProviderKind.init(rawValue:)) ?? .openAICompatible
     }
 }
 
@@ -70,7 +77,10 @@ final class ProviderStore: ObservableObject {
         let d = UserDefaults.standard
         if stored == nil, let legacyKey = d.string(forKey: "providerAPIKey"), !legacyKey.isEmpty {
             let legacyBase = d.string(forKey: "providerBaseURL") ?? ""
-            let target = providers.first { !legacyBase.isEmpty && legacyBase.hasPrefix($0.baseURL) } ?? providers[0]
+            // Skip empty baseURLs: the ChatGPT preset's "" would `hasPrefix`-match
+            // every legacy base URL and swallow the migrated key under a provider
+            // that has no key field to recover it from.
+            let target = providers.first { !legacyBase.isEmpty && !$0.baseURL.isEmpty && legacyBase.hasPrefix($0.baseURL) } ?? providers[0]
             SecretStore.set(legacyKey, account: target.id.uuidString)
             if let legacyModel = d.string(forKey: "providerModel") {
                 selectedModels[target.id] = legacyModel
@@ -84,7 +94,15 @@ final class ProviderStore: ObservableObject {
         var migrated = providers
         // Provider lists saved before the ChatGPT preset existed: add it once.
         if !migrated.contains(where: { $0.kind == .chatGPT }) {
-            migrated.insert(Self.chatGPTPreset(), at: min(1, migrated.count))
+            if let index = migrated.firstIndex(where: { $0.name == Self.chatGPTProviderName }) {
+                // A round-trip through an older build strips the `kind` field; heal
+                // that entry in place instead of inserting a second, undeletable one.
+                migrated[index].kind = .chatGPT
+                migrated[index].baseURL = ""
+                migrated[index].defaultModel = ChatGPTAuth.defaultModel
+            } else {
+                migrated.insert(Self.chatGPTPreset(), at: min(1, migrated.count))
+            }
         }
 
         self.providers = migrated
@@ -94,12 +112,23 @@ final class ProviderStore: ObservableObject {
         // didSet does not fire during init — persist the seeded/migrated state explicitly.
         persistJSON(self.providers, key: Keys.providers)
         persistJSON(self.selectedModels, key: Keys.selectedModels)
+
+        // ChatGPT sign-in state is global (not @Published), so republish when it
+        // changes or the switcher's configuredProviders would go stale after
+        // sign-out. Observer lives for the app's lifetime alongside the store.
+        NotificationCenter.default.addObserver(
+            forName: .popChatChatGPTAuthChanged, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.objectWillChange.send() }
+        }
     }
+
+    static let chatGPTProviderName = "OpenAI (ChatGPT)"
 
     static func chatGPTPreset() -> Provider {
         Provider(
             id: UUID(),
-            name: "OpenAI (ChatGPT)",
+            name: chatGPTProviderName,
             baseURL: "",
             isPreset: true,
             defaultModel: ChatGPTAuth.defaultModel,
@@ -148,6 +177,14 @@ final class ProviderStore: ObservableObject {
         selectedModels[selectedID] = model
     }
 
+    /// Seeds the fixed ChatGPT catalog onto the ChatGPT provider specifically —
+    /// not `selectedProvider` — so a post-sign-in seed lands on the right provider
+    /// even if the Settings picker moved during the browser flow.
+    func applyChatGPTCatalog() {
+        guard let provider = providers.first(where: { $0.kind == .chatGPT }) else { return }
+        knownModels[provider.id] = ChatGPTAuth.modelCatalog
+    }
+
     func currentKey() -> String {
         SecretStore.get(account: selectedID.uuidString) ?? ""
     }
@@ -189,7 +226,7 @@ final class ProviderStore: ObservableObject {
         guard let provider = selectedProvider else { return }
         // The ChatGPT backend has no /models endpoint — the catalog is fixed.
         if provider.kind == .chatGPT {
-            knownModels[provider.id] = ChatGPTAuth.modelCatalog
+            applyChatGPTCatalog()
             modelFetchError = nil
             return
         }

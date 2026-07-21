@@ -3,6 +3,12 @@ import CryptoKit
 import Foundation
 import Network
 
+extension Notification.Name {
+    /// Posted when ChatGPT sign-in state changes (sign in / out / forced sign-out
+    /// on a failed refresh) so stores holding non-observable auth state can republish.
+    static let popChatChatGPTAuthChanged = Notification.Name("popChatChatGPTAuthChanged")
+}
+
 /// "Sign in with ChatGPT" — the OAuth 2.1 PKCE flow used by OpenAI's Codex CLI,
 /// letting a ChatGPT Plus/Pro subscription pay for model usage instead of an API
 /// key. The browser handles login; a one-shot localhost listener catches the
@@ -34,7 +40,15 @@ enum ChatGPTAuth {
 
     struct AuthError: LocalizedError {
         let message: String
+        /// HTTP status when this came from the token endpoint — lets refresh
+        /// distinguish a revoked/expired grant (4xx) from a transient network error.
+        var statusCode: Int?
         var errorDescription: String? { message }
+
+        init(message: String, statusCode: Int? = nil) {
+            self.message = message
+            self.statusCode = statusCode
+        }
     }
 
     // MARK: - Stored tokens
@@ -61,6 +75,7 @@ enum ChatGPTAuth {
         guard let data = try? JSONEncoder().encode(tokens),
               let json = String(data: data, encoding: .utf8) else { return }
         SecretStore.set(json, account: secretsAccount)
+        NotificationCenter.default.post(name: .popChatChatGPTAuthChanged, object: nil)
     }
 
     static var isSignedIn: Bool { loadTokens() != nil }
@@ -72,6 +87,7 @@ enum ChatGPTAuth {
 
     static func signOut() {
         SecretStore.delete(account: secretsAccount)
+        NotificationCenter.default.post(name: .popChatChatGPTAuthChanged, object: nil)
     }
 
     // MARK: - Interactive sign-in
@@ -80,9 +96,9 @@ enum ChatGPTAuth {
     /// tears down the listener and surfaces as CancellationError.
     @MainActor
     static func signIn() async throws {
-        let verifier = randomURLSafe(bytes: 64)
+        let verifier = try randomURLSafe(bytes: 64)
         let challenge = base64URL(Data(SHA256.hash(data: Data(verifier.utf8))))
-        let state = randomURLSafe(bytes: 32)
+        let state = try randomURLSafe(bytes: 32)
 
         var components = URLComponents(string: issuer + "/oauth/authorize")!
         components.queryItems = [
@@ -119,10 +135,15 @@ enum ChatGPTAuth {
         expectedState: String,
         onReady: @escaping @Sendable () -> Void
     ) async throws -> String {
-        let listener = try NWListener(
-            using: .tcp,
-            on: NWEndpoint.Port(rawValue: redirectPort)!
+        // Bind loopback ONLY — the redirect must never be reachable from the LAN
+        // (Codex CLI binds 127.0.0.1 for exactly this reason). A default NWListener
+        // binds all interfaces, exposing the callback to the local network.
+        let parameters = NWParameters.tcp
+        parameters.requiredLocalEndpoint = .hostPort(
+            host: "127.0.0.1",
+            port: NWEndpoint.Port(rawValue: redirectPort)!
         )
+        let listener = try NWListener(using: parameters)
 
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
@@ -173,7 +194,7 @@ enum ChatGPTAuth {
                             respond(
                                 connection,
                                 status: "200 OK",
-                                body: "<html><body style=\"font-family:-apple-system;text-align:center;padding-top:80px\"><h2>Sign-in failed</h2><p>\(error.message)</p></body></html>"
+                                body: "<html><body style=\"font-family:-apple-system;text-align:center;padding-top:80px\"><h2>Sign-in failed</h2><p>\(htmlEscape(error.message))</p></body></html>"
                             )
                             if resumed.claim() {
                                 listener.stateUpdateHandler = nil
@@ -205,17 +226,28 @@ enum ChatGPTAuth {
         }
     }
 
+    /// Accumulates bytes until the CRLF that terminates the HTTP request line —
+    /// a single receive() can return a partial line if the request is split across
+    /// TCP segments, which would otherwise mis-parse the genuine redirect as a 404.
     private static func receiveRequestLine(
         _ connection: NWConnection,
+        accumulated: Data = Data(),
         completion: @escaping @Sendable (String?) -> Void
     ) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 16 * 1024) { data, _, _, error in
-            guard error == nil, let data, let text = String(data: data, encoding: .utf8),
-                  let firstLine = text.split(separator: "\r\n", maxSplits: 1).first else {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 16 * 1024) { data, _, isComplete, error in
+            var buffer = accumulated
+            if let data { buffer.append(data) }
+            if let terminator = buffer.range(of: Data("\r\n".utf8)) {
+                let lineData = buffer.subdata(in: buffer.startIndex..<terminator.lowerBound)
+                completion(String(data: lineData, encoding: .utf8))
+                return
+            }
+            // No full line yet: stop on error/EOF/oversize, otherwise keep reading.
+            if error != nil || isComplete || buffer.count > 16 * 1024 {
                 completion(nil)
                 return
             }
-            completion(String(firstLine))
+            receiveRequestLine(connection, accumulated: buffer, completion: completion)
         }
     }
 
@@ -232,6 +264,10 @@ enum ChatGPTAuth {
         let query = { (name: String) in
             components.queryItems?.first { $0.name == name }?.value
         }
+        // Ignore anything not carrying our state nonce (nil = keep waiting, don't
+        // abort). Checking state FIRST means a stray or forged request — including
+        // one with an `error` param — can't tear down a legitimate pending sign-in.
+        guard query("state") == expectedState else { return nil }
         if let error = query("error") {
             let description = query("error_description") ?? "no details"
             return .failure(AuthError(message: "OpenAI refused the sign-in: \(error) (\(description))"))
@@ -239,10 +275,15 @@ enum ChatGPTAuth {
         guard let code = query("code") else {
             return .failure(AuthError(message: "Redirect arrived without an authorization code."))
         }
-        guard query("state") == expectedState else {
-            return .failure(AuthError(message: "State mismatch in the OAuth redirect — try signing in again."))
-        }
         return .success(code)
+    }
+
+    private static func htmlEscape(_ string: String) -> String {
+        string
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
     }
 
     private static func respond(_ connection: NWConnection, status: String, body: String) {
@@ -312,6 +353,13 @@ enum ChatGPTAuth {
                 "client_id": clientID,
             ])
         } catch let error as AuthError {
+            // A 4xx from the token endpoint means the refresh token itself is bad
+            // (revoked/expired) — clear the session so the UI offers Sign in again
+            // instead of a dead end (green "Signed in" + every send saying "sign in").
+            // Transient/network errors keep the tokens so a later retry can succeed.
+            if let code = error.statusCode, (400..<500).contains(code) {
+                await MainActor.run { signOut() }
+            }
             throw AuthError(message: "ChatGPT session expired and refresh failed (\(error.message)). Sign in again in Settings → Providers.")
         }
         let updated = try buildTokens(from: response, previous: tokens)
@@ -336,7 +384,7 @@ enum ChatGPTAuth {
         }
         guard http.statusCode == 200 else {
             let body = String(decoding: data.prefix(300), as: UTF8.self)
-            throw AuthError(message: "Token endpoint returned HTTP \(http.statusCode): \(body)")
+            throw AuthError(message: "Token endpoint returned HTTP \(http.statusCode): \(body)", statusCode: http.statusCode)
         }
         return try JSONDecoder().decode(TokenResponse.self, from: data)
     }
@@ -389,9 +437,12 @@ enum ChatGPTAuth {
         return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
     }
 
-    private static func randomURLSafe(bytes count: Int) -> String {
+    private static func randomURLSafe(bytes count: Int) throws -> String {
         var bytes = [UInt8](repeating: 0, count: count)
-        _ = SecRandomCopyBytes(kSecRandomDefault, count, &bytes)
+        guard SecRandomCopyBytes(kSecRandomDefault, count, &bytes) == errSecSuccess else {
+            // Never derive PKCE/state from the zero buffer — that would void both.
+            throw AuthError(message: "Couldn't generate secure random data for sign-in. Try again.")
+        }
         return base64URL(Data(bytes))
     }
 

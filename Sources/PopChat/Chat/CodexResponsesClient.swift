@@ -77,7 +77,8 @@ enum CodexResponsesClient {
                     input: input,
                     model: config.model,
                     sessionID: sessionID,
-                    toolsEnabled: executor != nil && !roundsExhausted,
+                    toolsEnabled: executor != nil,
+                    forceFinal: roundsExhausted,
                     visiblePrefix: visible,
                     continuation: continuation
                 )
@@ -171,6 +172,7 @@ enum CodexResponsesClient {
         model: String,
         sessionID: String,
         toolsEnabled: Bool,
+        forceFinal: Bool,
         visiblePrefix: String,
         continuation: AsyncStream<ChatStreamEvent>.Continuation
     ) async throws -> RoundOutcome {
@@ -187,8 +189,12 @@ enum CodexResponsesClient {
             "prompt_cache_key": sessionID,
         ]
         if toolsEnabled {
+            // Keep tools DECLARED even on the forced final round — the input still
+            // carries function_call items referencing them, and the Responses API
+            // may 400 if they're undeclared. tool_choice "none" forces the answer
+            // instead of omitting the tools entirely.
             body["tools"] = codexTools
-            body["tool_choice"] = "auto"
+            body["tool_choice"] = forceFinal ? "none" : "auto"
         }
 
         // First attempt uses the cached access token; a 401 forces one refresh.
@@ -259,7 +265,10 @@ enum CodexResponsesClient {
                   let type = event["type"] as? String else { continue }
 
             switch type {
-            case "response.output_text.delta":
+            // Refusals stream as response.refusal.delta, not output_text — surface
+            // them as visible text too, or a refused answer yields done("") and
+            // ChatStore silently deletes the row (user sees nothing at all).
+            case "response.output_text.delta", "response.refusal.delta":
                 if let piece = event["delta"] as? String, !piece.isEmpty {
                     if roundText.isEmpty && !visible.isEmpty {
                         visible += "\n\n"

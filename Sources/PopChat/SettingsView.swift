@@ -52,6 +52,9 @@ struct SettingsView: View {
     @State private var chatGPTSignInTask: Task<Void, Never>?
     @State private var chatGPTAuthError: String?
     @State private var chatGPTAuthTick = false
+    // Bumped on every sign-in/cancel so a stale attempt can't clobber the shared
+    // UI state of a newer one (cancel-then-reclick race).
+    @State private var chatGPTSignInGeneration = 0
 
     var body: some View {
         VStack(spacing: 0) {
@@ -319,6 +322,7 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button("Cancel") {
+                    chatGPTSignInGeneration += 1
                     chatGPTSignInTask?.cancel()
                     chatGPTSignInTask = nil
                 }
@@ -334,17 +338,28 @@ struct SettingsView: View {
                 Spacer()
                 Button("Sign in with ChatGPT") {
                     chatGPTAuthError = nil
+                    chatGPTSignInGeneration += 1
+                    let generation = chatGPTSignInGeneration
                     chatGPTSignInTask = Task {
                         do {
                             try await ChatGPTAuth.signIn()
                         } catch is CancellationError {
                             // user cancelled — no error row
+                        } catch let error as URLError where error.code == .cancelled {
+                            // cancelled during the token-exchange request (URLSession
+                            // throws URLError, not CancellationError) — also silent
                         } catch {
-                            chatGPTAuthError = error.localizedDescription
+                            if generation == chatGPTSignInGeneration {
+                                chatGPTAuthError = error.localizedDescription
+                            }
                         }
+                        // Only the latest attempt owns the shared UI state.
+                        guard generation == chatGPTSignInGeneration else { return }
                         chatGPTSignInTask = nil
                         chatGPTAuthTick.toggle()
-                        await store.fetchModels()
+                        if ChatGPTAuth.isSignedIn {
+                            store.applyChatGPTCatalog()
+                        }
                     }
                 }
             }
