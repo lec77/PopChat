@@ -27,6 +27,8 @@ struct ChatView: View {
     @State private var dropTargeted = false
     @State private var historyShown = false
     @State private var modelPillHovered = false
+    /// 7c switcher popover — the pill shows a pressed state while it's open.
+    @State private var switcherShown = false
     @State private var actionPillHovered = false
     @State private var transcriptWidth: CGFloat = 680
     /// Width of the header pills row — the model pill caps at 46% of it (4a).
@@ -168,53 +170,12 @@ struct ChatView: View {
         .onPreferenceChange(HeaderWidthKey.self) { headerWidth = $0 }
     }
 
+    // Delta 5 (7c): a two-pane provider→model popover, not a Menu. Provider and
+    // model are one choice, and browsing a provider's catalog must not switch
+    // what the next message uses — a stock Menu can express neither.
     private var modelPill: some View {
-        Menu {
-            Section("Provider") {
-                ForEach(providerStore.configuredProviders) { provider in
-                    Button {
-                        providerStore.selectedID = provider.id
-                    } label: {
-                        HStack {
-                            Text(provider.name)
-                            if provider.id == providerStore.selectedID {
-                                Image(systemName: "checkmark")
-                            }
-                        }
-                    }
-                }
-                if providerStore.configuredProviders.count < providerStore.providers.count {
-                    Button("Set up more providers…") {
-                        NotificationCenter.default.post(name: .popChatOpenSettings, object: nil)
-                    }
-                }
-            }
-            Section("Model") {
-                let models = providerStore.knownModels[providerStore.selectedID] ?? []
-                ForEach(models, id: \.self) { model in
-                    Button {
-                        providerStore.setModel(model)
-                    } label: {
-                        HStack {
-                            Text(model)
-                            if model == providerStore.currentModel {
-                                Image(systemName: "checkmark")
-                            }
-                        }
-                    }
-                }
-                Button(models.isEmpty ? "Fetch models" : "Refresh models") {
-                    Task { await providerStore.fetchModels() }
-                }
-                .disabled(providerStore.isFetchingModels)
-            }
-            Divider()
-            // The real ⌘, lives in the invisible app menu (AppDelegate); inside a
-            // pull-down menu the modifier only renders as a hint, so no double-fire.
-            Button("Settings…") {
-                NotificationCenter.default.post(name: .popChatOpenSettings, object: nil)
-            }
-            .keyboardShortcut(",", modifiers: .command)
+        Button {
+            switcherShown.toggle()
         } label: {
             HStack(spacing: 4) {
                 Text(switcherLabel)
@@ -232,11 +193,13 @@ struct ChatView: View {
             // opaque pixels without an explicit content shape.
             .contentShape(Capsule())
         }
-        .menuStyle(.button)
         .buttonStyle(.plain)
         .fixedSize(horizontal: false, vertical: true)
-        .pillBackground(hovered: modelPillHovered)
+        .pillBackground(hovered: modelPillHovered, pressed: switcherShown)
         .onHover { modelPillHovered = $0 }
+        .popover(isPresented: $switcherShown, arrowEdge: .bottom) {
+            ProviderSwitcher(store: providerStore)
+        }
         // Invisible cap: the visible pill hugs its content, but never exceeds
         // 46% of the header row (the label truncates instead).
         .frame(maxWidth: max(headerWidth * 0.46, 140), alignment: .leading)

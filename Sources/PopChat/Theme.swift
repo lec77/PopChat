@@ -69,7 +69,9 @@ enum AppearanceChoice: String, CaseIterable, Identifiable {
 }
 
 enum Theme {
-    /// The four fixed accent choices — no free picker.
+    /// The four preset accent choices; Settings adds a color well beside them
+    /// for a custom hex (stored separately under "customAccentColor" so the
+    /// swatch survives switching to a preset and back).
     static let accentOptions = ["#0A84FF", "#BF5AF2", "#FF9F0A", "#30D158"]
     static let defaultAccentHex = "#0A84FF"
 
@@ -95,6 +97,17 @@ enum Theme {
             green: CGFloat((value >> 8) & 0xFF) / 255,
             blue: CGFloat(value & 0xFF) / 255,
             alpha: 1
+        )
+    }
+
+    /// Inverse of `color(_:)` — the color well hands back a Color in whatever
+    /// space the picker used, so convert to sRGB before packing the hex.
+    static func hex(_ color: Color) -> String {
+        let ns = NSColor(color).usingColorSpace(.sRGB) ?? NSColor(srgbRed: 0, green: 0, blue: 0, alpha: 1)
+        let channel = { (value: CGFloat) in Int((value * 255).rounded()) }
+        return String(
+            format: "#%02X%02X%02X",
+            channel(ns.redComponent), channel(ns.greenComponent), channel(ns.blueComponent)
         )
     }
 
@@ -231,15 +244,17 @@ struct PanelGlassBackground: View {
     }
 }
 
-/// Header chrome pills: capsule, hairline stroke, brighter on hover.
+/// Header chrome pills: capsule, hairline stroke, brighter on hover, brighter
+/// still while the control it opens is showing (7c's pressed state).
 struct PillBackground: ViewModifier {
     var hovered = false
+    var pressed = false
     @Environment(\.colorScheme) private var scheme
 
     func body(content: Content) -> some View {
         let fill: Color = scheme == .dark
-            ? Color.white.opacity(hovered ? 0.12 : 0.08)
-            : Color.white.opacity(hovered ? 0.7 : 0.55)
+            ? Color.white.opacity(pressed ? 0.18 : hovered ? 0.12 : 0.08)
+            : Color.white.opacity(pressed ? 0.85 : hovered ? 0.7 : 0.55)
         let stroke: Color = scheme == .dark ? Color.white.opacity(0.12) : Color.black.opacity(0.06)
         content
             .background(fill, in: Capsule())
@@ -263,8 +278,8 @@ struct GlassCard<S: InsettableShape>: ViewModifier {
 }
 
 extension View {
-    func pillBackground(hovered: Bool = false) -> some View {
-        modifier(PillBackground(hovered: hovered))
+    func pillBackground(hovered: Bool = false, pressed: Bool = false) -> some View {
+        modifier(PillBackground(hovered: hovered, pressed: pressed))
     }
 
     func glassCard<S: InsettableShape>(_ shape: S) -> some View {

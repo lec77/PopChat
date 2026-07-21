@@ -54,8 +54,15 @@ final class ProviderStore: ObservableObject {
     /// Last-fetched `/models` list per provider — persisted so the switcher works offline.
     @Published var knownModels: [UUID: [String]] { didSet { persistJSON(knownModels, key: Keys.knownModels) } }
     @Published var selectedModels: [UUID: String] { didSet { persistJSON(selectedModels, key: Keys.selectedModels) } }
-    @Published var modelFetchError: String?
-    @Published var isFetchingModels = false
+    /// Per-provider, not global: delta 5 renders fetch errors next to the provider
+    /// they belong to — inline in the switcher's model column and in the expanded
+    /// Settings row — and two providers can be fetching at once (the switcher
+    /// lazy-fetches whichever provider the rail is previewing).
+    @Published var modelFetchErrors: [UUID: String] = [:]
+    @Published var fetchingProviders: Set<UUID> = []
+    /// Providers the switcher has already auto-fetched this launch, so landing on
+    /// a provider whose server is down doesn't re-fire on every preview.
+    private var autoFetched: Set<UUID> = []
 
     private let defaults = UserDefaults.standard
 
@@ -166,19 +173,25 @@ final class ProviderStore: ObservableObject {
         providers.first { $0.id == selectedID }
     }
 
-    /// Providers worth offering in the quick switcher: they have an API key, a
-    /// fetched model list, or an explicitly chosen model (covers keyless local
-    /// servers). The active provider is always included. Settings shows all.
+    /// Is this provider set up enough to talk to? It has an API key, a fetched
+    /// model list, or an explicitly chosen model (which covers keyless local
+    /// servers) — or, for the ChatGPT kind, a live sign-in.
+    ///
+    /// This is the single predicate behind BOTH the switcher's provider rail and
+    /// the green dots in Settings › Providers (delta 5): a green row is exactly a
+    /// row the switcher offers. Don't fork it.
+    func isConfigured(_ provider: Provider) -> Bool {
+        if provider.kind == .chatGPT { return ChatGPTAuth.isSignedIn }
+        return !(SecretStore.get(account: provider.id.uuidString) ?? "").isEmpty
+            || !(knownModels[provider.id] ?? []).isEmpty
+            || selectedModels[provider.id] != nil
+    }
+
+    /// Providers worth offering in the quick switcher. The active provider is
+    /// always included even if it stopped qualifying (key cleared, signed out) —
+    /// the pill must never name a provider its own list omits. Settings shows all.
     var configuredProviders: [Provider] {
-        providers.filter { provider in
-            if provider.kind == .chatGPT {
-                return provider.id == selectedID || ChatGPTAuth.isSignedIn
-            }
-            return provider.id == selectedID
-                || !(SecretStore.get(account: provider.id.uuidString) ?? "").isEmpty
-                || !(knownModels[provider.id] ?? []).isEmpty
-                || selectedModels[provider.id] != nil
-        }
+        providers.filter { isConfigured($0) || $0.id == selectedID }
     }
 
     var currentModel: String {
@@ -186,8 +199,25 @@ final class ProviderStore: ObservableObject {
         return selectedModels[provider.id] ?? provider.defaultModel
     }
 
+    /// The model a provider would come back with — its remembered choice, else
+    /// its default. What the switcher commits when you click a provider row.
+    func rememberedModel(_ id: UUID) -> String {
+        selectedModels[id] ?? providers.first { $0.id == id }?.defaultModel ?? ""
+    }
+
     func setModel(_ model: String) {
         selectedModels[selectedID] = model
+    }
+
+    func setModel(_ model: String, for id: UUID) {
+        selectedModels[id] = model
+    }
+
+    /// Provider + model committed together — the switcher's unit of choice, and
+    /// the only place selection is written now that Settings is a pure catalog.
+    func select(_ id: UUID, model: String) {
+        if !model.isEmpty { selectedModels[id] = model }
+        selectedID = id
     }
 
     /// Seeds the fixed ChatGPT catalog onto the ChatGPT provider specifically —
@@ -199,11 +229,18 @@ final class ProviderStore: ObservableObject {
     }
 
     func currentKey() -> String {
-        SecretStore.get(account: selectedID.uuidString) ?? ""
+        key(for: selectedID)
     }
 
-    func setKey(_ key: String) {
-        SecretStore.set(key, account: selectedID.uuidString)
+    func key(for id: UUID) -> String {
+        SecretStore.get(account: id.uuidString) ?? ""
+    }
+
+    func setKey(_ key: String, for id: UUID) {
+        SecretStore.set(key, account: id.uuidString)
+        // Keys aren't @Published (they live in the secrets file), but the green
+        // dot / rail membership read them — republish so both refresh as typed.
+        objectWillChange.send()
     }
 
     func currentConfig() -> ProviderConfig? {
@@ -225,7 +262,9 @@ final class ProviderStore: ObservableObject {
         }
         let provider = Provider(id: UUID(), name: name, baseURL: "", isPreset: false, defaultModel: "")
         providers.append(provider)
-        selectedID = provider.id
+        // Deliberately does NOT select it (delta 5): Settings manages the catalog,
+        // the panel's pill owns what the next message actually uses. Adding a
+        // half-configured provider must not redirect the live conversation.
         return provider.id
     }
 
@@ -238,13 +277,13 @@ final class ProviderStore: ObservableObject {
         SecretStore.delete(account: id.uuidString)
         knownModels[id] = nil
         selectedModels[id] = nil
+        modelFetchErrors[id] = nil
+        autoFetched.remove(id)
         providers.remove(at: index)
         if selectedID == id {
             selectedID = providers[0].id
         }
     }
-
-    func removeSelected() { remove(selectedID) }
 
     // MARK: - Model list
 
@@ -253,29 +292,53 @@ final class ProviderStore: ObservableObject {
         let data: [Entry]
     }
 
+    func isFetching(_ id: UUID) -> Bool { fetchingProviders.contains(id) }
+
+    /// Fires one `/models` fetch the first time the switcher lands on a provider
+    /// that has nothing cached but plausibly could answer (a key, or a local
+    /// server needing none). Once per provider per launch — a provider whose
+    /// server is down must not re-fetch on every preview.
+    func lazyFetchModels(for id: UUID) {
+        guard let provider = providers.first(where: { $0.id == id }) else { return }
+        guard (knownModels[id] ?? []).isEmpty, !autoFetched.contains(id), !isFetching(id) else { return }
+        let hasKey = !key(for: id).isEmpty
+        let isLocal = provider.baseURL.contains("localhost") || provider.baseURL.contains("127.0.0.1")
+        guard provider.kind == .chatGPT || hasKey || isLocal else { return }
+        autoFetched.insert(id)
+        Task { await fetchModels(for: id) }
+    }
+
     func fetchModels() async {
-        guard let provider = selectedProvider else { return }
+        await fetchModels(for: selectedID)
+    }
+
+    func fetchModels(for id: UUID) async {
+        guard let provider = providers.first(where: { $0.id == id }) else { return }
         // The ChatGPT backend has no /models endpoint — the catalog is fixed.
         if provider.kind == .chatGPT {
             applyChatGPTCatalog()
-            modelFetchError = nil
+            modelFetchErrors[id] = nil
             return
         }
-        isFetchingModels = true
-        modelFetchError = nil
-        defer { isFetchingModels = false }
+        fetchingProviders.insert(id)
+        modelFetchErrors[id] = nil
+        defer { fetchingProviders.remove(id) }
 
+        guard !provider.baseURL.isEmpty else {
+            modelFetchErrors[id] = "Add a base URL for \(provider.name) first."
+            return
+        }
         guard var url = URL(string: provider.baseURL) else {
-            modelFetchError = "Invalid base URL: \(provider.baseURL)"
+            modelFetchErrors[id] = "Invalid base URL: \(provider.baseURL)"
             return
         }
         url.append(path: "models")
 
         var request = URLRequest(url: url)
         request.timeoutInterval = 20
-        let key = SecretStore.get(account: provider.id.uuidString) ?? ""
-        if !key.isEmpty {
-            request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        let apiKey = key(for: id)
+        if !apiKey.isEmpty {
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         }
 
         do {
@@ -283,20 +346,23 @@ final class ProviderStore: ObservableObject {
             guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
                 let code = (response as? HTTPURLResponse)?.statusCode ?? -1
                 let body = String(decoding: data.prefix(300), as: UTF8.self)
-                modelFetchError = "HTTP \(code) fetching models: \(body)"
+                modelFetchErrors[id] = "HTTP \(code) fetching models: \(body)"
                 return
             }
             let ids = try JSONDecoder().decode(ModelList.self, from: data).data.map(\.id).sorted()
             guard !ids.isEmpty else {
-                modelFetchError = "\(provider.name) returned an empty model list."
+                modelFetchErrors[id] = "\(provider.name) returned an empty model list."
                 return
             }
-            knownModels[provider.id] = ids
-            if selectedModels[provider.id] == nil, provider.defaultModel.isEmpty {
-                selectedModels[provider.id] = ids[0]
+            knownModels[id] = ids
+            // Only seed a model for a provider that has no default of its own —
+            // and never for one the user isn't on, which would silently make an
+            // unconfigured provider "configured" behind their back.
+            if selectedModels[id] == nil, provider.defaultModel.isEmpty, id == selectedID {
+                selectedModels[id] = ids[0]
             }
         } catch {
-            modelFetchError = "Fetching models failed: \(error.localizedDescription)"
+            modelFetchErrors[id] = "Fetching models failed: \(error.localizedDescription)"
         }
     }
 

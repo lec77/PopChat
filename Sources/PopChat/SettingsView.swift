@@ -30,13 +30,13 @@ struct SettingsView: View {
 
     @ObservedObject var store: ProviderStore
     @ObservedObject var shortcutStore: ShortcutStore
-    @State private var tab: Tab = .general
-    @State private var apiKeyDraft = ""
+    @State private var tab: Tab
     @State private var searchKeyDraft = ""
     @State private var systemPromptDraft = ChatStore.systemPrompt
     @AppStorage("searchEngine") private var searchEngine = SearchEngineChoice.duckduckgo.rawValue
     @AppStorage("webSearchEnabled") private var webEnabled = true
     @AppStorage("accentColor") private var accentHex = Theme.defaultAccentHex
+    @AppStorage("customAccentColor") private var customAccentHex = ""
     @AppStorage("bubbleStyle") private var bubbleStyleRaw = BubbleStyle.accentTint.rawValue
     @AppStorage("streamingMode") private var streamingModeRaw = StreamingMode.perCharacter.rawValue
     @AppStorage("liquidGlass") private var liquidGlass = true
@@ -59,6 +59,25 @@ struct SettingsView: View {
     @State private var chatGPTSignInGeneration = 0
     /// Custom provider awaiting delete confirmation (removal drops its API key).
     @State private var providerPendingDeletion: UUID?
+    /// The one provider row disclosed for editing (delta 5, 7b). Nothing here
+    /// touches `store.selectedID` — Settings is a catalog, the panel's pill owns
+    /// what is live.
+    @State private var editingID: UUID?
+    /// Non-nil only from the design-QA harness, which needs a row already
+    /// disclosed to render the editor band.
+    private let initialEditingID: UUID?
+    /// API-key draft, scoped to `editingID`. Reloaded on every expand; the old
+    /// `apiKeyDraft` + `onChange(of: store.selectedID)` pair is exactly the
+    /// coupling delta 5 removes.
+    @State private var keyDraft = ""
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    init(store: ProviderStore, shortcutStore: ShortcutStore, tab: Tab = .general, editing: UUID? = nil) {
+        self.store = store
+        self.shortcutStore = shortcutStore
+        _tab = State(initialValue: tab)
+        initialEditingID = editing
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -76,11 +95,7 @@ struct SettingsView: View {
             .formStyle(.grouped)
         }
         .frame(width: 540, height: 620)
-        .onAppear {
-            apiKeyDraft = store.currentKey()
-            searchKeyDraft = currentSearchKey()
-        }
-        .onChange(of: store.selectedID) { _, _ in apiKeyDraft = store.currentKey() }
+        .onAppear { searchKeyDraft = currentSearchKey() }
         .onChange(of: searchEngine) { _, _ in searchKeyDraft = currentSearchKey() }
     }
 
@@ -157,7 +172,7 @@ struct SettingsView: View {
             } header: {
                 Text("Chat Style")
             } footer: {
-                Text("Applies to your messages in the panel. Streaming text: Per-character fades in glyph by glyph, Per-sentence commits a sentence at a time. Defaults: Accent tint, Blue, Per-character streaming. Panel tint defaults to the system glass appearance; the slider overrides it for PopChat only. Reduce Transparency always wins.")
+                Text("Applies to your messages in the panel. The color well beside the accent swatches sets a custom accent. Streaming text: Per-character fades in glyph by glyph, Per-sentence commits a sentence at a time. Defaults: Accent tint, Blue, Per-character streaming. Panel tint defaults to the system glass appearance; the slider overrides it for PopChat only. Reduce Transparency always wins.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -178,30 +193,53 @@ struct SettingsView: View {
         }
     }
 
+    /// Four presets + a custom color well. Picking a color in the well both
+    /// stores it (as its own swatch, so a trip through the presets doesn't lose
+    /// it) and makes it the live accent; the extra swatch only appears once the
+    /// custom color is something the presets don't already offer.
     private var accentRow: some View {
-        HStack {
+        HStack(spacing: 2) {
             Text("Accent color")
             Spacer()
             ForEach(Theme.accentOptions, id: \.self) { hex in
-                let selected = hex == accentHex
-                Button {
-                    accentHex = hex
-                } label: {
-                    Circle()
-                        .fill(Theme.color(hex))
-                        .frame(width: 18, height: 18)
-                        .padding(2)
-                        .overlay(
-                            Circle()
-                                .strokeBorder(Theme.color(hex), lineWidth: 2)
-                                .opacity(selected ? 1 : 0)
-                        )
-                        .contentShape(Circle())
-                }
-                .buttonStyle(.plain)
-                .help(hex)
+                accentSwatch(hex)
             }
+            if !customAccentHex.isEmpty, !Theme.accentOptions.contains(customAccentHex) {
+                accentSwatch(customAccentHex)
+            }
+            AccentColorWell(
+                hex: Binding(
+                    get: { customAccentHex.isEmpty ? accentHex : customAccentHex },
+                    set: { hex in
+                        customAccentHex = hex
+                        accentHex = hex
+                    }
+                )
+            )
+            .frame(width: 22, height: 22)
+            .padding(.leading, 6)
+            .help("Choose a custom accent color")
         }
+    }
+
+    private func accentSwatch(_ hex: String) -> some View {
+        let selected = hex == accentHex
+        return Button {
+            accentHex = hex
+        } label: {
+            Circle()
+                .fill(Theme.color(hex))
+                .frame(width: 18, height: 18)
+                .padding(2)
+                .overlay(
+                    Circle()
+                        .strokeBorder(Theme.color(hex), lineWidth: 2)
+                        .opacity(selected ? 1 : 0)
+                )
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .help(hex)
     }
 
     private var liquidGlassRow: some View {
@@ -263,56 +301,63 @@ struct SettingsView: View {
 
     // MARK: - Providers
 
+    /// Pure catalog (delta 5, 7b): every provider, no radio, no selection. A row
+    /// discloses in place; the live provider+model is chosen from the panel's pill.
+    /// The old design made "click the row you want to paste a key into" silently
+    /// switch what the next message used.
+    /// Hand-built rather than a `Form`: the grouped Form owns the layout of every
+    /// row it contains — it re-reads a label/field HStack as its own label/value
+    /// row and sizes the control itself, so the 230pt fields and the full-bleed
+    /// editor band are simply not expressible inside it (same family as the
+    /// vertical-axis-TextField trap in Commands, delta 2 §4e). The card below
+    /// reproduces the grouped chrome by hand.
     private var providersTab: some View {
-        Form {
-            Section {
-                providerList
-                HStack {
-                    Button {
-                        store.addCustom()
-                    } label: {
-                        Label("Add Custom Provider", systemImage: "plus")
-                    }
-                    Spacer()
-                }
-            } header: {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 6) {
                 Text("Providers")
-            } footer: {
-                Text("Presets stay; providers you add can be renamed and removed.")
-                    .font(.caption)
+                    .font(.system(size: 11, weight: .semibold))
+                    .textCase(.uppercase)
+                    .tracking(0.4)
                     .foregroundStyle(.secondary)
-            }
-
-            Section {
-                if let index = store.providers.firstIndex(where: { $0.id == store.selectedID }) {
-                    if store.providers[index].kind == .chatGPT {
-                        chatGPTAuthRows
-                    } else {
-                        if !store.providers[index].isPreset {
-                            TextField("Name", text: $store.providers[index].name)
+                    .padding(.leading, 2)
+                VStack(spacing: 0) {
+                    ForEach(Array(store.providers.enumerated()), id: \.element.id) { offset, provider in
+                        if offset > 0 {
+                            Divider().padding(.leading, 32).opacity(0.7)
                         }
-                        TextField("Base URL", text: $store.providers[index].baseURL)
-                            .help("Include /v1 where the provider requires it; local servers (Ollama, LM Studio) need no key.")
-                        SecureField("API Key", text: $apiKeyDraft)
-                            .onChange(of: apiKeyDraft) { _, newValue in
-                                store.setKey(newValue)
-                            }
+                        providerRow(provider)
+                        if editingID == provider.id {
+                            editorBand(provider)
+                        }
                     }
-                    modelRow
-                    if let error = store.modelFetchError {
-                        Label(error, systemImage: "exclamationmark.triangle.fill")
-                            .font(.caption)
-                            .foregroundStyle(.red)
-                    }
+                    Divider().padding(.leading, 10).opacity(0.7)
+                    addProviderRow
                 }
-            } header: {
-                Text(store.selectedProvider?.name ?? "Provider")
-            } footer: {
-                Text("Keys are stored locally in Application Support, never synced.")
-                    .font(.caption)
+                .background(
+                    formCardBackground,
+                    in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: editingID)
+                Text("The live provider and model are picked from the pill in the chat panel — this list only manages what shows up there. Keys are stored locally, never synced.")
+                    .font(.system(size: 11))
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 2)
                     .help("~/Library/Application Support/PopChat/secrets.json, user-only permissions.")
             }
+            .padding(.horizontal, 20)
+            .padding(.top, 18)
+            .padding(.bottom, 20)
+        }
+        .background(formPageBackground)
+        .onExitCommand { collapseEditor() }
+        .onAppear {
+            if let id = initialEditingID { toggleEditor(id) }
         }
         .confirmationDialog(
             "Remove “\(store.providers.first { $0.id == providerPendingDeletion }?.name ?? "")”?",
@@ -329,62 +374,201 @@ struct SettingsView: View {
         }
     }
 
-    /// Every provider, preset and added, in one list — the switcher only shows the
-    /// configured ones, so this is the single place an added provider is visible
-    /// (and the only place it can be deleted).
-    private var providerList: some View {
-        VStack(spacing: 0) {
-            ForEach(Array(store.providers.enumerated()), id: \.element.id) { offset, provider in
-                if offset > 0 {
-                    Divider().opacity(0.5)
-                }
-                providerRow(provider)
-            }
-        }
-        .padding(.vertical, -2)
+    /// Matches the grouped `Form` on the neighbouring tabs: same page color, and a
+    /// group box that is a relative overlay on it rather than an absolute gray —
+    /// so the card tracks the page in both appearances instead of needing two
+    /// hand-picked constants that drift with the system.
+    private var formPageBackground: Color {
+        Color(nsColor: .windowBackgroundColor)
+    }
+
+    private var formCardBackground: Color {
+        Color.primary.opacity(scheme == .dark ? 0.040 : 0.038)
     }
 
     private func providerRow(_ provider: Provider) -> some View {
-        let selected = provider.id == store.selectedID
-        return HStack(spacing: 8) {
-            Image(systemName: selected ? "largecircle.fill.circle" : "circle")
-                .font(.system(size: 12))
-                .foregroundStyle(selected ? Color.accentColor : Color.secondary.opacity(0.55))
+        let expanded = editingID == provider.id
+        let ready = providerIsReady(provider)
+        return HStack(spacing: 10) {
+            Circle()
+                .fill(ready ? Color.green : Color.secondary.opacity(0.35))
+                .frame(width: 8, height: 8)
             VStack(alignment: .leading, spacing: 1) {
-                Text(provider.name)
+                HStack(spacing: 6) {
+                    Text(provider.name)
+                        .font(.system(size: 13))
+                        .lineLimit(1)
+                    if !provider.isPreset {
+                        Text("Custom")
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .textCase(.uppercase)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Color.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 Text(providerSubtitle(provider))
-                    .font(.caption)
+                    .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
             Spacer(minLength: 8)
+            Image(systemName: "chevron.right")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary.opacity(0.6))
+                .rotationEffect(.degrees(expanded ? 90 : 0))
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .background(expanded ? Color.primary.opacity(0.03) : .clear)
+        .contentShape(Rectangle())
+        .onTapGesture { toggleEditor(provider.id) }
+        .contextMenu {
             if !provider.isPreset {
-                Button {
+                Button("Remove Provider…", role: .destructive) {
                     providerPendingDeletion = provider.id
-                } label: {
-                    Image(systemName: "trash")
-                        .font(.system(size: 11.5))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 22, height: 22)
-                        .contentShape(Circle())
                 }
-                .buttonStyle(.plain)
-                .help("Remove this provider")
             }
         }
-        .padding(.vertical, 5)
-        .contentShape(Rectangle())
-        .onTapGesture { store.selectedID = provider.id }
+    }
+
+    private var addProviderRow: some View {
+        HStack {
+            Button("Add Provider…") {
+                let id = store.addCustom()
+                keyDraft = ""
+                editingID = id
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+    }
+
+    /// Green-dot law (delta 5): identical predicate to `configuredProviders`, so a
+    /// green row here is exactly a row the panel's switcher offers.
+    private func providerIsReady(_ provider: Provider) -> Bool {
+        _ = chatGPTAuthTick // re-read the dot when sign-in state changes
+        return store.isConfigured(provider)
     }
 
     private func providerSubtitle(_ provider: Provider) -> String {
         if provider.kind == .chatGPT {
-            _ = chatGPTAuthTick // re-read the row when sign-in state changes
-            return ChatGPTAuth.isSignedIn ? "Signed in · your ChatGPT plan" : "Not signed in"
+            _ = chatGPTAuthTick
+            guard ChatGPTAuth.isSignedIn else { return "Not signed in" }
+            return "Signed in · \(ChatGPTAuth.planLabel ?? "your ChatGPT plan")"
         }
-        if provider.baseURL.isEmpty { return "No base URL yet" }
-        return provider.baseURL
+        let host = URL(string: provider.baseURL)?.host ?? provider.baseURL
+        let isLocal = ["localhost", "127.0.0.1"].contains(host)
+        guard store.isConfigured(provider) else {
+            if provider.baseURL.isEmpty { return "Not set up" }
+            // A local server needs no key, so "Needs API key" would send the user
+            // looking for one that doesn't exist — it needs a model list instead.
+            return isLocal ? "\(host) · no models fetched" : "Needs API key"
+        }
+        var parts = [host.isEmpty ? provider.baseURL : host]
+        let count = store.knownModels[provider.id]?.count ?? 0
+        if count > 0 {
+            parts.append("\(count) model\(count == 1 ? "" : "s")")
+        }
+        if isLocal, store.key(for: provider.id).isEmpty {
+            parts.append("no key needed")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    // MARK: - Inline provider editor (7b)
+
+    private func toggleEditor(_ id: UUID) {
+        if editingID == id {
+            collapseEditor()
+        } else {
+            // Drafts commit as they're typed (scoped to the expanded row), so
+            // switching rows only has to reload the draft for the new one.
+            keyDraft = store.key(for: id)
+            editingID = id
+        }
+    }
+
+    private func collapseEditor() {
+        editingID = nil
+        keyDraft = ""
+    }
+
+    /// The disclosed block under a row: a quaternary well band spanning the card,
+    /// hairline top and bottom.
+    @ViewBuilder
+    private func editorBand(_ provider: Provider) -> some View {
+        let index = store.providers.firstIndex { $0.id == provider.id }
+        VStack(alignment: .leading, spacing: 8) {
+            if provider.kind == .chatGPT {
+                chatGPTAuthRows
+            } else if let index {
+                if !provider.isPreset {
+                    editorField("Name") {
+                        TextField("", text: $store.providers[index].name)
+                    }
+                }
+                editorField("Base URL") {
+                    TextField("", text: $store.providers[index].baseURL)
+                        .help("Include /v1 where the provider requires it; local servers (Ollama, LM Studio) need no key.")
+                }
+                editorField("API Key") {
+                    SecureField("", text: $keyDraft)
+                        .onChange(of: keyDraft) { _, newValue in
+                            store.setKey(newValue, for: provider.id)
+                        }
+                }
+            }
+            modelRow(for: provider)
+            Text("Used when this provider is picked for the first time; after that the pill remembers your last model per provider.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let error = store.modelFetchErrors[provider.id] {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if !provider.isPreset {
+                Button("Remove Provider…", role: .destructive) {
+                    providerPendingDeletion = provider.id
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 12))
+                .foregroundStyle(.red)
+                .padding(.top, 2)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.025))
+        .overlay(alignment: .top) { Divider().opacity(0.7) }
+        .overlay(alignment: .bottom) { Divider().opacity(0.7) }
+    }
+
+    /// Label left, 230pt field right — the Form's own label/value row can't be
+    /// used here because the band sits inside a single full-bleed list row.
+    private func editorField<Content: View>(_ label: String, @ViewBuilder _ field: () -> Content) -> some View {
+        HStack(spacing: 12) {
+            Text(label)
+                .font(.system(size: 12.5))
+            Spacer(minLength: 8)
+            // The width has to be pinned on a CONTAINER, not the control: a
+            // grouped Form lays a bare TextField out as its own label/value row
+            // and sizes it from the text, ignoring `.frame` on the field itself.
+            HStack(spacing: 0) {
+                field()
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12))
+            }
+            .frame(width: 230)
+            .fixedSize()
+        }
     }
 
     /// Sign-in UI for the ChatGPT provider — replaces the Base URL/API key fields.
@@ -628,40 +812,91 @@ struct SettingsView: View {
 
     // MARK: - Helpers
 
-    private var modelRow: some View {
-        HStack(spacing: 6) {
-            TextField("Model", text: Binding(
-                get: { store.currentModel },
-                set: { store.setModel($0) }
-            ))
-            let models = store.knownModels[store.selectedID] ?? []
-            Menu {
-                ForEach(models, id: \.self) { model in
-                    Button(model) { store.setModel(model) }
+    /// Default model for the EDITED provider — never the selected one. Settings
+    /// no longer has a selection to piggyback on (delta 5).
+    private func modelRow(for provider: Provider) -> some View {
+        let id = provider.id
+        let models = store.knownModels[id] ?? []
+        return editorField("Default model") {
+            HStack(spacing: 6) {
+                TextField("", text: Binding(
+                    get: { store.rememberedModel(id) },
+                    set: { store.setModel($0, for: id) }
+                ))
+                Menu {
+                    ForEach(models, id: \.self) { model in
+                        Button(model) { store.setModel(model, for: id) }
+                    }
+                } label: {
+                    Image(systemName: "chevron.up.chevron.down")
                 }
-            } label: {
-                Image(systemName: "chevron.up.chevron.down")
-            }
-            .menuStyle(.button)
-            .fixedSize()
-            .disabled(models.isEmpty)
-            .help(models.isEmpty ? "Fetch the model list first" : "Pick from fetched models")
-            Button {
-                Task { await store.fetchModels() }
-            } label: {
-                if store.isFetchingModels {
-                    ProgressView().controlSize(.small)
-                } else {
-                    Image(systemName: "arrow.clockwise")
+                .menuStyle(.button)
+                .menuIndicator(.hidden) // the label IS the indicator
+                .fixedSize()
+                .disabled(models.isEmpty)
+                .help(models.isEmpty ? "Fetch the model list first" : "Pick from fetched models")
+                Button {
+                    Task { await store.fetchModels(for: id) }
+                } label: {
+                    if store.isFetching(id) {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Image(systemName: "arrow.clockwise")
+                    }
                 }
+                .fixedSize()
+                .help("Fetch model list from the provider")
             }
-            .fixedSize()
-            .help("Fetch model list from the provider")
         }
     }
 
     private func currentSearchKey() -> String {
         guard let account = SearchEngineChoice(rawValue: searchEngine)?.apiKeyAccount else { return "" }
         return SecretStore.get(account: account) ?? ""
+    }
+}
+
+/// The custom-accent well. SwiftUI's `ColorPicker` draws a wide bordered
+/// control that dwarfs the 18pt preset swatches; `NSColorWell` in `.minimal`
+/// style is the same picker drawn as a single swatch, so the row still reads as
+/// one strip. The binding is a hex string — the app's accent is stored that way,
+/// and comparing hexes (not NSColors, which differ by color space) is what keeps
+/// updateNSView from bouncing the well's own edit back at it.
+struct AccentColorWell: NSViewRepresentable {
+    @Binding var hex: String
+
+    /// A bare `.frame` doesn't shrink it — the well keeps its intrinsic width and
+    /// spills past the row, so the size has to come from the view itself.
+    final class CompactColorWell: NSColorWell {
+        override var intrinsicContentSize: NSSize { NSSize(width: 22, height: 22) }
+    }
+
+    func makeNSView(context: Context) -> NSColorWell {
+        let well = CompactColorWell(frame: NSRect(x: 0, y: 0, width: 22, height: 22))
+        well.colorWellStyle = .minimal
+        well.supportsAlpha = false
+        well.color = Theme.nsColor(hex)
+        well.target = context.coordinator
+        well.action = #selector(Coordinator.colorChanged(_:))
+        return well
+    }
+
+    func updateNSView(_ well: NSColorWell, context: Context) {
+        context.coordinator.hex = $hex
+        if Theme.hex(Color(nsColor: well.color)) != hex {
+            well.color = Theme.nsColor(hex)
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(hex: $hex) }
+
+    final class Coordinator: NSObject {
+        var hex: Binding<String>
+
+        init(hex: Binding<String>) { self.hex = hex }
+
+        @objc func colorChanged(_ sender: NSColorWell) {
+            hex.wrappedValue = Theme.hex(Color(nsColor: sender.color))
+        }
     }
 }

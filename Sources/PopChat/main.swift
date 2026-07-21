@@ -1,4 +1,5 @@
 import AppKit
+import SwiftUI
 
 // Headless streaming checks (no UI):
 //   POPCHAT_API_KEY=… .build/debug/PopChat --smoke          plain streaming
@@ -1241,6 +1242,236 @@ if CommandLine.arguments.contains("--smoke-find") {
                     print("find-field IME composition survived a transcript update")
                     print("PASS")
                     try? FileManager.default.removeItem(at: scratch)
+                    exit(0)
+                default:
+                    fail("harness ran past its steps")
+                }
+            }
+        }
+        app.run()
+    }
+}
+
+// Design QA: renders a view to PNG in-process (`--shot <settings|switcher> <path>`),
+// so the layout can be checked without screen-recording permission.
+if let shotIndex = CommandLine.arguments.firstIndex(of: "--shot"),
+   CommandLine.arguments.count > shotIndex + 2 {
+    MainActor.assumeIsolated {
+        let which = CommandLine.arguments[shotIndex + 1]
+        let path = CommandLine.arguments[shotIndex + 2]
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        if CommandLine.arguments.contains("--dark") {
+            app.appearance = NSAppearance(named: .darkAqua)
+        } else if CommandLine.arguments.contains("--light") {
+            app.appearance = NSAppearance(named: .aqua)
+        }
+
+        let defaults = UserDefaults.standard
+        let providerKeys = ["providersJSON", "selectedProviderID", "knownModelsJSON", "selectedModelsJSON"]
+        let snapshot = providerKeys.reduce(into: [String: Any?]()) { $0[$1] = defaults.object(forKey: $1) }
+        func restore() {
+            for key in providerKeys {
+                if let value = snapshot[key] ?? nil { defaults.set(value, forKey: key) } else { defaults.removeObject(forKey: key) }
+            }
+        }
+
+        let store = ProviderStore()
+        let deepseek = Provider(id: UUID(), name: "DeepSeek", baseURL: "https://api.deepseek.com", isPreset: true, defaultModel: "deepseek-chat")
+        let chatgpt = ProviderStore.chatGPTPreset()
+        let router = Provider(id: UUID(), name: "OpenRouter", baseURL: "https://openrouter.ai/api/v1", isPreset: true, defaultModel: "openrouter/auto")
+        let ollama = Provider(id: UUID(), name: "Ollama (local)", baseURL: "http://localhost:11434/v1", isPreset: true, defaultModel: "")
+        let groq = Provider(id: UUID(), name: "Groq", baseURL: "https://api.groq.com/openai/v1", isPreset: false, defaultModel: "llama-3.3-70b")
+        store.providers = [chatgpt, deepseek, groq, router, ollama]
+        store.knownModels = [
+            deepseek.id: ["deepseek-chat", "deepseek-coder", "deepseek-reasoner"],
+            groq.id: ["llama-3.3-70b", "mixtral-8x7b"],
+        ]
+        store.selectedModels = [deepseek.id: "deepseek-chat", groq.id: "llama-3.3-70b"]
+        store.selectedID = deepseek.id
+
+        let content: NSView
+        let size: NSSize
+        switch which {
+        case "switcher":
+            content = NSHostingView(rootView: ProviderSwitcher(store: store)
+                .padding(20)
+                .background(Color(nsColor: .windowBackgroundColor)))
+            size = NSSize(width: 412, height: 340)
+        case "general":
+            content = NSHostingView(rootView: SettingsView(
+                store: store, shortcutStore: ShortcutStore(), tab: .general
+            ))
+            size = NSSize(width: 540, height: 620)
+        default:
+            content = NSHostingView(rootView: SettingsView(
+                store: store, shortcutStore: ShortcutStore(), tab: .providers, editing: groq.id
+            ))
+            size = NSSize(width: 540, height: 620)
+        }
+        let window = NSWindow(
+            contentRect: NSRect(origin: .zero, size: size),
+            styleMask: [.titled], backing: .buffered, defer: false
+        )
+        window.contentView = content
+        window.makeKeyAndOrderFront(nil)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+            MainActor.assumeIsolated {
+                guard let view = window.contentView,
+                      let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else {
+                    print("FAIL: could not build a bitmap")
+                    restore()
+                    exit(1)
+                }
+                view.cacheDisplay(in: view.bounds, to: rep)
+                guard let data = rep.representation(using: .png, properties: [:]) else {
+                    print("FAIL: could not encode PNG")
+                    restore()
+                    exit(1)
+                }
+                try? data.write(to: URL(fileURLWithPath: path))
+                print("wrote \(path)")
+                restore()
+                exit(0)
+            }
+        }
+        app.run()
+    }
+}
+
+// Delta 5's core rule, which is a BEHAVIOUR and not a look: browsing providers
+// must never switch what the next message uses. Drives the real 7c switcher
+// through ↓ / → / ↓ / ↩ and asserts nothing commits until ↩, then asserts the
+// catalog side (addCustom must not select) and that the green-dot predicate and
+// the rail agree.
+//
+// Runs against the real ProviderStore — the four provider defaults keys are
+// snapshotted and restored on every exit path, and only `.test` base URLs are
+// ever installed, so no network and no lasting change to the user's setup.
+if CommandLine.arguments.contains("--smoke-providers") {
+    MainActor.assumeIsolated {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+
+        let defaults = UserDefaults.standard
+        let providerKeys = ["providersJSON", "selectedProviderID", "knownModelsJSON", "selectedModelsJSON"]
+        let snapshot = providerKeys.reduce(into: [String: Any?]()) { $0[$1] = defaults.object(forKey: $1) }
+        func restore() {
+            for key in providerKeys {
+                if let value = snapshot[key] ?? nil {
+                    defaults.set(value, forKey: key)
+                } else {
+                    defaults.removeObject(forKey: key)
+                }
+            }
+        }
+        func fail(_ message: String) -> Never {
+            print("FAIL: \(message)")
+            restore()
+            exit(1)
+        }
+
+        let store = ProviderStore()
+        let alpha = Provider(id: UUID(), name: "Harness A", baseURL: "https://a.test/v1", isPreset: true, defaultModel: "a-1")
+        let beta = Provider(id: UUID(), name: "Harness B", baseURL: "https://b.test/v1", isPreset: true, defaultModel: "b-1")
+        store.providers = [alpha, beta]
+        store.knownModels = [alpha.id: ["a-1", "a-2"], beta.id: ["b-1", "b-2"]]
+        store.selectedModels = [alpha.id: "a-1", beta.id: "b-1"]
+        store.selectedID = alpha.id
+        guard store.configuredProviders.map(\.id) == [alpha.id, beta.id] else {
+            fail("seeded providers are not both offered by the switcher")
+        }
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 372, height: 400),
+            styleMask: [.titled, .closable], backing: .buffered, defer: false
+        )
+        window.contentView = NSHostingView(rootView: ProviderSwitcher(store: store))
+        window.makeKeyAndOrderFront(nil)
+        app.activate(ignoringOtherApps: true)
+
+        /// The switcher's invisible first responder (ProviderSwitcher.KeyCaptureView).
+        func captureView() -> NSView? {
+            // Match the AppKit view itself, not SwiftUI's representable host —
+            // the host's class name embeds the wrapped type's name too.
+            var found: NSView?
+            func walk(_ view: NSView) {
+                if String(describing: type(of: view)).contains("CaptureView"), view.acceptsFirstResponder {
+                    found = view
+                }
+                for sub in view.subviews where found == nil { walk(sub) }
+            }
+            walk(window.contentView ?? NSView())
+            return found
+        }
+
+        func send(_ keyCode: UInt16, _ label: String) {
+            guard let view = captureView() else { fail("switcher key capture view vanished") }
+            guard let event = NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+                windowNumber: window.windowNumber, context: nil,
+                characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: keyCode
+            ) else { fail("could not synthesize \(label)") }
+            view.keyDown(with: event)
+        }
+
+        var step = 0
+        Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { _ in
+            MainActor.assumeIsolated {
+                step += 1
+                switch step {
+                case 1:
+                    return // let the popover body appear and claim first responder
+                case 2:
+                    guard let view = captureView() else { fail("switcher did not install its key capture view") }
+                    guard window.firstResponder === view else {
+                        fail("switcher key capture view did not take first responder")
+                    }
+                    send(125, "↓")             // rail: Harness A → Harness B
+                    if store.selectedID != alpha.id {
+                        fail("arrowing the provider rail COMMITTED — preview must not switch (delta 5, 7c)")
+                    }
+                case 3:
+                    send(124, "→")             // into the model column
+                    send(125, "↓")             // b-1 → b-2
+                    if store.selectedID != alpha.id {
+                        fail("moving into the model column committed a provider switch")
+                    }
+                    if store.currentModel != "a-1" {
+                        fail("previewing another provider's models changed the live model")
+                    }
+                case 4:
+                    send(36, "↩")
+                case 5:
+                    if store.selectedID != beta.id { fail("↩ did not commit the previewed provider") }
+                    if store.selectedModels[beta.id] != "b-2" { fail("↩ did not commit the focused model") }
+                    print("preview stayed inert; ↩ committed Harness B · b-2")
+
+                    // Catalog side (7b): adding a provider in Settings must not
+                    // redirect the live conversation.
+                    let added = store.addCustom()
+                    if store.selectedID != beta.id {
+                        fail("addCustom() switched the live provider — Settings must never write selectedID")
+                    }
+                    store.remove(added)
+
+                    // The green dot and the rail are one predicate: every
+                    // configured provider is offered, and the only row the rail
+                    // adds is the live one.
+                    let rail = Set(store.configuredProviders.map(\.id))
+                    for provider in store.providers {
+                        let configured = store.isConfigured(provider)
+                        if configured && !rail.contains(provider.id) {
+                            fail("\(provider.name) is green in Settings but missing from the switcher")
+                        }
+                        if !configured && rail.contains(provider.id) && provider.id != store.selectedID {
+                            fail("\(provider.name) is offered by the switcher but gray in Settings")
+                        }
+                    }
+                    print("green-dot law matches the switcher rail")
+                    print("PASS")
+                    restore()
                     exit(0)
                 default:
                     fail("harness ran past its steps")
