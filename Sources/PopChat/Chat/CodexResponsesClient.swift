@@ -54,7 +54,17 @@ enum CodexResponsesClient {
         sessionID: String?,
         continuation: AsyncStream<ChatStreamEvent>.Continuation
     ) async {
-        var input = history.map(inputItem(for:))
+        // The Responses backend takes the system prompt as top-level `instructions`,
+        // not as an input message with role "system" (opencode does the same on the
+        // OAuth path). ChatStore prepends the configured system prompt as a system
+        // WireMessage for the chat-completions client, so peel those out here and
+        // fold them into instructions; the rest of the history becomes input items.
+        let systemTexts = history.compactMap { message -> String? in
+            guard message.role == "system", case .text(let text) = message.content else { return nil }
+            return text
+        }
+        let instructions = systemTexts.isEmpty ? baseInstructions : systemTexts.joined(separator: "\n\n")
+        var input = history.filter { $0.role != "system" }.map(inputItem(for:))
         var visible = ""
         var executor: WebToolExecutor?
         if case .localTools(let engine) = webAccess {
@@ -76,6 +86,7 @@ enum CodexResponsesClient {
                 outcome = try await streamOneRound(
                     input: input,
                     model: config.model,
+                    instructions: instructions,
                     sessionID: sessionID,
                     toolsEnabled: executor != nil,
                     forceFinal: roundsExhausted,
@@ -181,6 +192,7 @@ enum CodexResponsesClient {
     private static func streamOneRound(
         input: [[String: Any]],
         model: String,
+        instructions: String,
         sessionID: String,
         toolsEnabled: Bool,
         forceFinal: Bool,
@@ -189,7 +201,7 @@ enum CodexResponsesClient {
     ) async throws -> RoundOutcome {
         var body: [String: Any] = [
             "model": model,
-            "instructions": baseInstructions,
+            "instructions": instructions,
             "input": input,
             "store": false,
             "stream": true,
