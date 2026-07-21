@@ -138,14 +138,14 @@ final class PanelController: NSObject, NSWindowDelegate {
                 Self.transformAnimation(
                     from: Self.scaledTransform(for: layer, scale: 0.97, rise: 8, flipped: panel.contentView?.isFlipped ?? true),
                     to: CATransform3DIdentity,
-                    duration: 0.28,
+                    duration: 0.20,
                     timing: CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.3, 1)
                 ),
                 forKey: "present"
             )
         }
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.28
+            context.duration = 0.20
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
             panel.animator().alphaValue = 1
         }
@@ -159,7 +159,7 @@ final class PanelController: NSObject, NSWindowDelegate {
             let shrink = Self.transformAnimation(
                 from: CATransform3DIdentity,
                 to: Self.scaledTransform(for: layer, scale: 0.98, rise: 0, flipped: true),
-                duration: 0.16,
+                duration: 0.11,
                 timing: CAMediaTimingFunction(name: .easeIn)
             )
             shrink.fillMode = .forwards
@@ -167,7 +167,7 @@ final class PanelController: NSObject, NSWindowDelegate {
             layer.add(shrink, forKey: "dismiss")
         }
         NSAnimationContext.runAnimationGroup({ [weak self] context in
-            context.duration = 0.16
+            context.duration = 0.11
             context.timingFunction = CAMediaTimingFunction(name: .easeIn)
             self?.panel.animator().alphaValue = 0
         }, completionHandler: { [weak self] in
