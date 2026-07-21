@@ -214,6 +214,8 @@ struct SettingsView: View {
         }
     }
 
+    // labelsHidden is load-bearing: a bare Slider reserves an EMPTY label slot
+    // inside its frame, which squeezed the track and stranded "Clear" mid-row.
     private var panelTintRow: some View {
         let disabled = !liquidGlass || reduceTransparency
         return HStack(spacing: 8) {
@@ -229,6 +231,7 @@ struct SettingsView: View {
                 ),
                 in: 0...1
             )
+            .labelsHidden()
             .frame(width: 180)
             Text("Tinted")
                 .font(.system(size: 10.5))

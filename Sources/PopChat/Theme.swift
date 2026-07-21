@@ -217,11 +217,13 @@ struct PanelGlassBackground: View {
     }
 
     // Linear from zero — the delta spec's 0.30/0.40 floor meant the "Clear" end
-    // of the slider was never actually clear.
+    // of the slider was never actually clear. Ceiling 0.95: "Tinted" reads as
+    // near-solid (the old 0.80/0.85 still looked quite transparent) while
+    // keeping a whisper of glass; fully solid remains the Liquid glass toggle.
     private func tintFill(_ t: Double) -> Color {
         scheme == .dark
-            ? Color(red: 28 / 255, green: 28 / 255, blue: 30 / 255).opacity(0.80 * t)
-            : Color(red: 250 / 255, green: 250 / 255, blue: 252 / 255).opacity(0.85 * t)
+            ? Color(red: 28 / 255, green: 28 / 255, blue: 30 / 255).opacity(0.95 * t)
+            : Color(red: 250 / 255, green: 250 / 255, blue: 252 / 255).opacity(0.95 * t)
     }
 }
 
