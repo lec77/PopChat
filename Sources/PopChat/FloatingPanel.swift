@@ -1,4 +1,5 @@
 import AppKit
+import SwiftUI
 
 /// The popup window. `.nonactivatingPanel` is the load-bearing style: the panel can
 /// take keyboard focus without activating PopChat, so the previously active app stays
@@ -20,7 +21,10 @@ final class FloatingPanel: NSPanel {
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         titleVisibility = .hidden
         titlebarAppearsTransparent = true
-        isMovableByWindowBackground = true
+        // Dragging is confined to the top pill strip (WindowDragStrip in
+        // ChatView) — whole-background dragging stole drags that should start
+        // text selections in the transcript.
+        isMovableByWindowBackground = false
         hidesOnDeactivate = false
         // The SwiftUI content draws its own rounded glass shell; the window itself
         // is a clear canvas (the system shadow follows the drawn shape).
@@ -67,4 +71,36 @@ final class FloatingPanel: NSPanel {
         return pasteboard.string(forType: .string) == nil
             && pasteboard.canReadObject(forClasses: [NSImage.self], options: nil)
     }
+}
+
+/// Transparent surface that drags the window — placed behind the top pill row,
+/// the only draggable region of the panel.
+final class WindowDragView: NSView {
+    override func mouseDown(with event: NSEvent) {
+        window?.performDrag(with: event)
+    }
+
+    /// The strip overlays the transcript; forward scroll events so two-finger
+    /// scrolling keeps working when the cursor is over it.
+    override func scrollWheel(with event: NSEvent) {
+        if let scrollView = Self.findScrollView(window?.contentView) {
+            scrollView.scrollWheel(with: event)
+        } else {
+            super.scrollWheel(with: event)
+        }
+    }
+
+    private static func findScrollView(_ view: NSView?) -> NSScrollView? {
+        guard let view else { return nil }
+        if let scroll = view as? NSScrollView { return scroll }
+        for sub in view.subviews {
+            if let found = findScrollView(sub) { return found }
+        }
+        return nil
+    }
+}
+
+struct WindowDragStrip: NSViewRepresentable {
+    func makeNSView(context: Context) -> WindowDragView { WindowDragView() }
+    func updateNSView(_ view: WindowDragView, context: Context) {}
 }

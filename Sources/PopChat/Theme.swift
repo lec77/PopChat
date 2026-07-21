@@ -117,14 +117,28 @@ struct PanelGlassBackground: View {
             solidFill
         } else {
             ZStack {
-                VisualEffectBackground()
                 if #available(macOS 26.0, *) {
-                    Color.clear.glassEffect(.regular, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
-                } else if panelTint < 0 {
-                    // Pre-glass fallback default tint.
-                    scheme == .dark
-                        ? Color(red: 28 / 255, green: 28 / 255, blue: 30 / 255).opacity(0.55)
-                        : Color(red: 250 / 255, green: 250 / 255, blue: 252 / 255).opacity(0.62)
+                    // glassEffect alone — a second live NSVisualEffectView backdrop
+                    // underneath doubled the compositing cost for no visual gain.
+                    // If glass ever stops sampling behind the window (blank/clear
+                    // panel), re-add VisualEffectBackground() beneath it.
+                    // Untouched slider (-1) keeps the system `regular` look; once
+                    // set, the `clear` variant + a 0→max tint ramp spans genuinely
+                    // transparent → strongly tinted (`regular`'s inherent frosting
+                    // put a floor under how clear the panel could get).
+                    if panelTint >= 0 {
+                        Color.clear.glassEffect(.clear, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+                    } else {
+                        Color.clear.glassEffect(.regular, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+                    }
+                } else {
+                    VisualEffectBackground()
+                    if panelTint < 0 {
+                        // Pre-glass fallback default tint.
+                        scheme == .dark
+                            ? Color(red: 28 / 255, green: 28 / 255, blue: 30 / 255).opacity(0.55)
+                            : Color(red: 250 / 255, green: 250 / 255, blue: 252 / 255).opacity(0.62)
+                    }
                 }
                 if panelTint >= 0 {
                     tintFill(min(panelTint, 1))
@@ -137,10 +151,12 @@ struct PanelGlassBackground: View {
         scheme == .dark ? Theme.color("#232326") : Theme.color("#f5f5f7")
     }
 
+    // Linear from zero — the delta spec's 0.30/0.40 floor meant the "Clear" end
+    // of the slider was never actually clear.
     private func tintFill(_ t: Double) -> Color {
         scheme == .dark
-            ? Color(red: 28 / 255, green: 28 / 255, blue: 30 / 255).opacity(0.30 + 0.50 * t)
-            : Color(red: 250 / 255, green: 250 / 255, blue: 252 / 255).opacity(0.40 + 0.45 * t)
+            ? Color(red: 28 / 255, green: 28 / 255, blue: 30 / 255).opacity(0.80 * t)
+            : Color(red: 250 / 255, green: 250 / 255, blue: 252 / 255).opacity(0.85 * t)
     }
 }
 

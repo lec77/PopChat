@@ -90,10 +90,15 @@ if let flagIndex = CommandLine.arguments.firstIndex(of: "--smoke-file"),
 // thread checks main-thread responsiveness. Catches layout-convergence hangs.
 if CommandLine.arguments.contains("--smoke-scroll") {
     nonisolated(unsafe) var lastPong = Date()
+    nonisolated(unsafe) var maxPingLatency = 0.0
     Thread.detachNewThread {
         while true {
-            DispatchQueue.main.async { lastPong = Date() }
-            Thread.sleep(forTimeInterval: 0.5)
+            let sent = Date()
+            DispatchQueue.main.async {
+                lastPong = Date()
+                maxPingLatency = max(maxPingLatency, Date().timeIntervalSince(sent))
+            }
+            Thread.sleep(forTimeInterval: 0.25)
             if Date().timeIntervalSince(lastPong) > 3 {
                 print("HANG pid=\(ProcessInfo.processInfo.processIdentifier) — main thread stalled >3s")
                 fflush(stdout)
@@ -138,7 +143,7 @@ if CommandLine.arguments.contains("--smoke-scroll") {
                     fflush(stdout)
                 }
                 if elapsed >= 12 {
-                    print("PASS: 12s of scrolling, main thread responsive")
+                    print(String(format: "PASS: 12s of scrolling, max main-thread ping latency %.0f ms", maxPingLatency * 1000))
                     exit(0)
                 }
             }

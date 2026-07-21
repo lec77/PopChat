@@ -32,6 +32,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.openSettings() }
         }
+
+        // Build the panel + view hierarchy and load the resumed conversation off
+        // the critical path, so the first hotkey press shows a warm panel.
+        DispatchQueue.main.async { [weak self] in
+            self?.panelController.prewarm()
+        }
     }
 
     @objc private func statusItemClicked() {

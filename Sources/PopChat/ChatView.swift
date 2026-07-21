@@ -1,5 +1,4 @@
 import SwiftUI
-import KeyboardShortcuts
 
 extension Notification.Name {
     static let popChatOpenSettings = Notification.Name("PopChatOpenSettings")
@@ -9,6 +8,10 @@ extension Notification.Name {
 
 /// The "Glass" panel: translucent rounded shell, header chrome as overlay pills
 /// the transcript scrolls under, and a floating capsule input at the bottom.
+///
+/// Performance shape (do not regress): typing state lives entirely inside
+/// ComposerView, so keystrokes never invalidate the transcript; transcript rows
+/// are Equatable-gated so streaming ticks re-render only the active row.
 struct ChatView: View {
     @ObservedObject var state: PanelState
     @ObservedObject var store: ChatStore
@@ -19,10 +22,7 @@ struct ChatView: View {
     /// can shrink to just chrome + input.
     var onCompactHeightChange: (CGFloat) -> Void = { _ in }
 
-    @State private var draft = ""
-    @State private var completionIndex = 0
-    @State private var pendingAttachments: [Attachment] = []
-    @State private var attachNotice: String?
+    @State private var composerModel = ComposerModel()
     @State private var dropTargeted = false
     @State private var historyShown = false
     @State private var modelPillHovered = false
@@ -32,9 +32,7 @@ struct ChatView: View {
     /// scroll disengages so streaming never yanks the view.
     @State private var pinnedToBottom = true
     @State private var showNewMessagesPill = false
-    @AppStorage("webSearchEnabled") private var webEnabled = true
     @AppStorage("accentColor") private var accentHex = Theme.defaultAccentHex
-    @FocusState private var inputFocused: Bool
     @Environment(\.colorScheme) private var scheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -64,18 +62,12 @@ struct ChatView: View {
         }
         .frame(minWidth: 480, minHeight: store.messages.isEmpty ? nil : 320)
         .dropDestination(for: URL.self) { urls, _ in
-            handleFiles(urls)
+            composerModel.handleFiles(urls)
             return true
         } isTargeted: { targeted in
             dropTargeted = targeted
         }
         .onExitCommand { onClose() }
-        .onAppear { inputFocused = true }
-        .onChange(of: state.focusBump) { _, _ in inputFocused = true }
-        .onChange(of: draft) { _, _ in completionIndex = 0 }
-        .onReceive(NotificationCenter.default.publisher(for: .popChatAttachPasteboard)) { _ in
-            _ = handlePasteboard()
-        }
     }
 
     private var mainContent: some View {
@@ -83,10 +75,20 @@ struct ChatView: View {
             if store.messages.isEmpty {
                 pillsRow
                     .padding(12)
+                    .background(WindowDragStrip())
             } else {
                 transcriptZone
             }
-            bottomArea
+            ComposerView(
+                model: composerModel,
+                shortcutStore: shortcutStore,
+                isStreaming: store.isStreaming,
+                isEmptyChat: store.messages.isEmpty,
+                focusBump: state.focusBump,
+                onSend: { text, attachments in store.send(text, attachments: attachments) },
+                onStop: { store.stop() },
+                onFocusRequest: { state.focusBump += 1 }
+            )
         }
         .background(
             GeometryReader { geometry in
@@ -222,7 +224,9 @@ struct ChatView: View {
     // MARK: - Transcript
 
     private var transcriptZone: some View {
-        ScrollViewReader { proxy in
+        let streamingID = store.isStreaming ? store.messages.last(where: { $0.role == .assistant })?.id : nil
+        let bubbleMaxWidth = max(220, (transcriptWidth - 32) * 0.78)
+        return ScrollViewReader { proxy in
             trackingBottomPin(
                 ScrollView {
                     // Plain VStack, deliberately: LazyVStack re-estimates row heights as
@@ -233,9 +237,10 @@ struct ChatView: View {
                         ForEach(store.messages) { message in
                             MessageRow(
                                 message: message,
-                                showCaret: store.isStreaming && message.id == store.messages.last(where: { $0.role == .assistant })?.id,
-                                bubbleMaxWidth: max(220, (transcriptWidth - 32) * 0.78)
+                                showCaret: message.id == streamingID,
+                                bubbleMaxWidth: bubbleMaxWidth
                             )
+                            .equatable()
                             .transition(rowTransition(for: message.role))
                         }
                         Color.clear.frame(height: 1).id("bottom")
@@ -253,7 +258,9 @@ struct ChatView: View {
             .onPreferenceChange(TranscriptWidthKey.self) { transcriptWidth = $0 }
             .mask(topFade)
             .overlay(alignment: .top) {
-                pillsRow.padding(12)
+                pillsRow
+                    .padding(12)
+                    .background(WindowDragStrip())
             }
             .overlay(alignment: .bottom) {
                 if showNewMessagesPill {
@@ -264,9 +271,10 @@ struct ChatView: View {
             }
             .animation(.easeOut(duration: 0.15), value: showNewMessagesPill)
             .animation(reduceMotion ? .easeOut(duration: 0.12) : .easeOut(duration: 0.18), value: store.messages.count)
-            // Text ticks arrive ~30×/s while streaming: the follow-scroll must NOT
-            // be animated, or each tick restarts an animation and layout never
-            // goes idle (this froze the app). Animate only on new rows.
+            // Text ticks arrive many times per second while streaming: the
+            // follow-scroll must NOT be animated, or each tick restarts an
+            // animation and layout never goes idle (this froze the app).
+            // Animate only on new rows.
             .onChange(of: store.messages.last?.text) { _, _ in
                 if pinnedToBottom {
                     proxy.scrollTo("bottom", anchor: .bottom)
@@ -285,6 +293,20 @@ struct ChatView: View {
                 if pinned { showNewMessagesPill = false }
             }
         }
+    }
+
+    /// Transcript scrolls under the pills; the top 44pt fades out beneath them.
+    private var topFade: some View {
+        VStack(spacing: 0) {
+            LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom)
+                .frame(height: 44)
+            Color.black
+        }
+    }
+
+    private func rowTransition(for role: ChatRole) -> AnyTransition {
+        guard !reduceMotion, role == .user else { return .opacity }
+        return .opacity.combined(with: .move(edge: .bottom))
     }
 
     /// Disengage following only on an actual upward scroll (offset decrease) —
@@ -337,286 +359,6 @@ struct ChatView: View {
         var offset: CGFloat
         var bottomDistance: CGFloat
     }
-
-    /// Transcript scrolls under the pills; the top 44pt fades out beneath them.
-    private var topFade: some View {
-        VStack(spacing: 0) {
-            LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom)
-                .frame(height: 44)
-            Color.black
-        }
-    }
-
-    private func rowTransition(for role: ChatRole) -> AnyTransition {
-        guard !reduceMotion, role == .user else { return .opacity }
-        return .opacity.combined(with: .move(edge: .bottom))
-    }
-
-    // MARK: - Slash-command completion
-
-    private var completionCandidates: [PromptShortcut] {
-        guard draft.hasPrefix("/"), !draft.contains(" ") else { return [] }
-        let query = String(draft.dropFirst()).lowercased()
-        return shortcutStore.shortcuts.filter {
-            query.isEmpty || $0.name.lowercased().hasPrefix(query)
-        }
-    }
-
-    private var slashCard: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            ForEach(Array(completionCandidates.enumerated()), id: \.element.id) { index, shortcut in
-                HStack(spacing: 8) {
-                    Text("/" + shortcut.name)
-                        .fontWeight(.medium)
-                    Text(shortcut.template.replacingOccurrences(of: "\n", with: " "))
-                        .lineLimit(1)
-                        .foregroundStyle(.secondary)
-                }
-                .font(.system(size: 12.5))
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(
-                    index == completionIndex ? accent.opacity(0.16) : .clear,
-                    in: RoundedRectangle(cornerRadius: 11, style: .continuous)
-                )
-                .contentShape(Rectangle())
-                .onTapGesture { complete(with: shortcut) }
-            }
-        }
-        .padding(6)
-        .glassCard(RoundedRectangle(cornerRadius: 16, style: .continuous))
-    }
-
-    private func complete(with shortcut: PromptShortcut? = nil) {
-        let candidates = completionCandidates
-        guard let chosen = shortcut ?? (candidates.indices.contains(completionIndex) ? candidates[completionIndex] : candidates.first) else { return }
-        draft = "/" + chosen.name + " "
-    }
-
-    // MARK: - Attachments
-
-    private var attachCard: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            if !pendingAttachments.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        ForEach(pendingAttachments) { attachment in
-                            attachmentChip(attachment)
-                        }
-                    }
-                }
-            }
-            if let notice = attachNotice {
-                Label(notice, systemImage: "exclamationmark.triangle.fill")
-                    .font(.system(size: 11))
-                    .foregroundStyle(scheme == .dark ? Theme.warningOrange : Theme.warningTextLight)
-                    .textSelection(.enabled)
-            }
-        }
-        .padding(10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .glassCard(RoundedRectangle(cornerRadius: 16, style: .continuous))
-    }
-
-    private func attachmentChip(_ attachment: Attachment) -> some View {
-        AttachmentChip(attachment: attachment) {
-            pendingAttachments.removeAll { $0.id == attachment.id }
-            if pendingAttachments.isEmpty { attachNotice = nil }
-        }
-    }
-
-    private func handleFiles(_ urls: [URL]) {
-        attachNotice = nil
-        for url in urls {
-            Task {
-                let result = await AttachmentLoader.load(url: url)
-                switch result {
-                case .success(let attachment):
-                    pendingAttachments.append(attachment)
-                    if let note = attachment.note, attachment.noteKind == .warning {
-                        attachNotice = "\(attachment.filename): \(note)"
-                    }
-                    updateSizeWarning()
-                case .failure(let error):
-                    attachNotice = error.message
-                }
-            }
-        }
-    }
-
-    private func updateSizeWarning() {
-        let totalChars = pendingAttachments.reduce(0) { total, attachment in
-            if case .text(let text) = attachment.content { return total + text.count }
-            return total
-        }
-        if totalChars > 50_000 {
-            attachNotice = "Attachments total ~\(totalChars / 4 / 1000)k tokens — may exceed smaller models' context windows."
-        }
-    }
-
-    private func attachViaPicker() {
-        let panel = NSOpenPanel()
-        panel.allowsMultipleSelection = true
-        panel.canChooseDirectories = false
-        NSApp.activate(ignoringOtherApps: true)
-        if panel.runModal() == .OK {
-            handleFiles(panel.urls)
-        }
-        state.focusBump += 1
-    }
-
-    /// ⌘V with a file or image on the pasteboard attaches it; plain text pastes normally.
-    private func handlePasteboard() -> Bool {
-        let pasteboard = NSPasteboard.general
-        if let urls = pasteboard.readObjects(
-            forClasses: [NSURL.self],
-            options: [.urlReadingFileURLsOnly: true]
-        ) as? [URL], !urls.isEmpty {
-            handleFiles(urls)
-            return true
-        }
-        if pasteboard.string(forType: .string) == nil, let image = NSImage(pasteboard: pasteboard) {
-            attachNotice = nil
-            switch AttachmentLoader.load(image: image, suggestedName: "pasted-image.jpg") {
-            case .success(let attachment):
-                pendingAttachments.append(attachment)
-                updateSizeWarning()
-            case .failure(let error):
-                attachNotice = error.message
-            }
-            return true
-        }
-        return false
-    }
-
-    // MARK: - Input area
-
-    private var bottomArea: some View {
-        VStack(spacing: 8) {
-            if !completionCandidates.isEmpty {
-                slashCard
-                    .transition(.opacity)
-            }
-            if !pendingAttachments.isEmpty || attachNotice != nil {
-                attachCard
-                    .transition(.opacity)
-            }
-            inputCapsule
-            if store.messages.isEmpty {
-                hintRow
-            }
-        }
-        .padding(.top, 10)
-        .padding(.horizontal, 12)
-        .padding(.bottom, 12)
-        .animation(.easeOut(duration: 0.12), value: completionCandidates.isEmpty)
-        .animation(.easeOut(duration: 0.12), value: pendingAttachments.count)
-        .animation(.easeOut(duration: 0.12), value: attachNotice)
-    }
-
-    private var inputCapsule: some View {
-        HStack(spacing: 10) {
-            Button(action: attachViaPicker) {
-                Image(systemName: "paperclip")
-                    .font(.system(size: 16))
-                    .foregroundStyle(.secondary)
-            }
-            .buttonStyle(.plain)
-            .help("Attach files (or drag & drop, or paste)")
-            Button {
-                webEnabled.toggle()
-            } label: {
-                Image(systemName: "globe")
-                    .font(.system(size: 16))
-                    .foregroundStyle(webEnabled ? accent : Color.secondary)
-            }
-            .buttonStyle(.plain)
-            .help(webEnabled ? "Web access on — model may search and read pages" : "Web access off")
-            TextField("Message…  (“/” for shortcuts)", text: $draft, axis: .vertical)
-                .lineLimit(1...6)
-                .textFieldStyle(.plain)
-                .font(.system(size: 13))
-                .focused($inputFocused)
-                .onSubmit(submit)
-                .onKeyPress(phases: .down) { press in
-                    // ⌘V is handled earlier: FloatingPanel.performKeyEquivalent
-                    // (attachables) or the Edit menu (plain text).
-                    // Shift+Return inserts a newline at the cursor (Return sends).
-                    if press.modifiers.contains(.shift), press.key == .return {
-                        if let editor = NSApp.keyWindow?.firstResponder as? NSTextView {
-                            editor.insertNewlineIgnoringFieldEditor(nil)
-                            return .handled
-                        }
-                        return .ignored
-                    }
-                    return .ignored
-                }
-                .onKeyPress(.upArrow) {
-                    guard !completionCandidates.isEmpty else { return .ignored }
-                    completionIndex = max(0, completionIndex - 1)
-                    return .handled
-                }
-                .onKeyPress(.downArrow) {
-                    guard !completionCandidates.isEmpty else { return .ignored }
-                    completionIndex = min(completionCandidates.count - 1, completionIndex + 1)
-                    return .handled
-                }
-                .onKeyPress(.tab) {
-                    guard !completionCandidates.isEmpty else { return .ignored }
-                    complete()
-                    return .handled
-                }
-                .onKeyPress(.return) {
-                    guard !completionCandidates.isEmpty else { return .ignored }
-                    complete()
-                    return .handled
-                }
-            if store.isStreaming {
-                Button(action: store.stop) {
-                    Image(systemName: "stop.circle.fill")
-                        .font(.system(size: 26))
-                        .foregroundStyle(Theme.stopRed)
-                }
-                .buttonStyle(.plain)
-                .help("Stop generating")
-            } else {
-                Button(action: submit) {
-                    Image(systemName: "arrow.up.circle.fill")
-                        .font(.system(size: 26))
-                        .foregroundStyle(canSend ? accent : Color.primary.opacity(0.25))
-                }
-                .buttonStyle(.plain)
-                .disabled(!canSend)
-            }
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
-        .glassCard(Capsule())
-    }
-
-    private var canSend: Bool {
-        !draft.trimmingCharacters(in: .whitespaces).isEmpty || !pendingAttachments.isEmpty
-    }
-
-    private var hintRow: some View {
-        Text("\(hotkeyLabel) toggles · ⇧↩ newline · Tab completes")
-            .font(.system(size: 10.5))
-            .foregroundStyle(.tertiary)
-            .frame(maxWidth: .infinity)
-    }
-
-    private var hotkeyLabel: String {
-        KeyboardShortcuts.getShortcut(for: .togglePopChat).map(String.init(describing:)) ?? "⌥Space"
-    }
-
-    private func submit() {
-        guard !store.isStreaming else { return }
-        store.send(draft, attachments: pendingAttachments)
-        draft = ""
-        pendingAttachments = []
-        attachNotice = nil
-    }
 }
 
 private struct ContentHeightKey: PreferenceKey {
@@ -633,62 +375,10 @@ private struct TranscriptWidthKey: PreferenceKey {
     }
 }
 
-private struct AttachmentChip: View {
-    let attachment: Attachment
-    let onRemove: () -> Void
-
-    @State private var showNote = false
-    @Environment(\.colorScheme) private var scheme
-
-    var body: some View {
-        HStack(spacing: 5) {
-            Image(systemName: icon)
-                .font(.system(size: 11))
-            Text(attachment.filename)
-                .font(.system(size: 11))
-                .lineLimit(1)
-                .frame(maxWidth: 160)
-            if let note = attachment.note {
-                Button {
-                    showNote.toggle()
-                } label: {
-                    Image(systemName: attachment.noteKind == .warning ? "exclamationmark.triangle.fill" : "info.circle")
-                        .font(.system(size: 10))
-                        .foregroundStyle(attachment.noteKind == .warning ? Theme.warningOrange : Color.secondary)
-                }
-                .buttonStyle(.plain)
-                .help(note)
-                .popover(isPresented: $showNote, arrowEdge: .bottom) {
-                    Text(note)
-                        .font(.callout)
-                        .textSelection(.enabled)
-                        .padding(12)
-                        .frame(maxWidth: 320)
-                }
-            }
-            Button(action: onRemove) {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-            }
-            .buttonStyle(.plain)
-            .help("Remove attachment")
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(
-            scheme == .dark ? Color.white.opacity(0.08) : Color.black.opacity(0.06),
-            in: Capsule()
-        )
-    }
-
-    private var icon: String {
-        if case .image = attachment.content { return "photo" }
-        return "doc.text"
-    }
-}
-
-private struct MessageRow: View {
+/// Equatable so unchanged rows skip body re-evaluation entirely during
+/// streaming ticks and keystrokes — no markdown segmentation, no
+/// attributed-string rebuilds, no measurement.
+private struct MessageRow: View, Equatable {
     let message: ChatMessage
     let showCaret: Bool
     let bubbleMaxWidth: CGFloat
@@ -696,6 +386,12 @@ private struct MessageRow: View {
     @AppStorage("bubbleStyle") private var bubbleStyleRaw = BubbleStyle.accentTint.rawValue
     @AppStorage("accentColor") private var accentHex = Theme.defaultAccentHex
     @Environment(\.colorScheme) private var scheme
+
+    static func == (lhs: MessageRow, rhs: MessageRow) -> Bool {
+        lhs.message == rhs.message
+            && lhs.showCaret == rhs.showCaret
+            && abs(lhs.bubbleMaxWidth - rhs.bubbleMaxWidth) < 0.5
+    }
 
     var body: some View {
         switch message.role {

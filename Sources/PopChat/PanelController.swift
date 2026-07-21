@@ -64,6 +64,7 @@ final class PanelController: NSObject, NSWindowDelegate {
                 onCompactHeightChange: { [weak self] height in self?.compactHeightChanged(height) }
             )
         )
+        panel.contentView?.wantsLayer = true // presentation animates this layer
         return panel
     }()
 
@@ -84,27 +85,42 @@ final class PanelController: NSObject, NSWindowDelegate {
         NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
     }
 
-    // Summon: fade + scale 0.97→1 + rise from 8pt below. Dismiss: quick fade with a
-    // slight shrink. Both collapse to opacity-only under Reduce Motion.
+    /// Builds the panel and lays it out once, without showing it — called shortly
+    /// after launch so the first hotkey press skips all cold construction.
+    func prewarm() {
+        _ = panel
+        panel.contentView?.layoutSubtreeIfNeeded()
+    }
+
+    // Summon: fade + scale 0.97→1 + rise from 8pt below. Dismiss: quick fade with
+    // a slight shrink. The scale/rise is a Core Animation transform on the content
+    // layer — NEVER animate the real window frame: every frame of a window resize
+    // re-runs full SwiftUI layout and backdrop compositing (this was a visible
+    // hitch with long transcripts). Both collapse to opacity-only under Reduce
+    // Motion.
     func show() {
         isHiding = false
         if chatStore.messages.isEmpty {
             setContentHeight(lastCompactHeight ?? 110, animated: false)
         }
         position()
-        let target = panel.frame
         panel.alphaValue = 0
-        if !reduceMotion {
-            var start = target.insetBy(dx: target.width * 0.015, dy: target.height * 0.015)
-            start.origin.y -= 8
-            panel.setFrame(start, display: false)
-        }
         panel.makeKeyAndOrderFront(nil)
+        if !reduceMotion, let layer = panel.contentView?.layer {
+            layer.add(
+                Self.transformAnimation(
+                    from: Self.scaledTransform(for: layer, scale: 0.97, rise: 8, flipped: panel.contentView?.isFlipped ?? true),
+                    to: CATransform3DIdentity,
+                    duration: 0.28,
+                    timing: CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.3, 1)
+                ),
+                forKey: "present"
+            )
+        }
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.28
-            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.3, 1)
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
             panel.animator().alphaValue = 1
-            panel.animator().setFrame(target, display: true)
         }
         state.focusBump += 1
     }
@@ -112,39 +128,97 @@ final class PanelController: NSObject, NSWindowDelegate {
     func hide() {
         guard panel.isVisible, !isHiding else { return }
         isHiding = true
-        let restingFrame = panel.frame
+        if !reduceMotion, let layer = panel.contentView?.layer {
+            let shrink = Self.transformAnimation(
+                from: CATransform3DIdentity,
+                to: Self.scaledTransform(for: layer, scale: 0.98, rise: 0, flipped: true),
+                duration: 0.16,
+                timing: CAMediaTimingFunction(name: .easeIn)
+            )
+            shrink.fillMode = .forwards
+            shrink.isRemovedOnCompletion = false
+            layer.add(shrink, forKey: "dismiss")
+        }
         NSAnimationContext.runAnimationGroup({ [weak self] context in
-            guard let self else { return }
             context.duration = 0.16
             context.timingFunction = CAMediaTimingFunction(name: .easeIn)
-            panel.animator().alphaValue = 0
-            if !reduceMotion {
-                let shrunk = restingFrame.insetBy(dx: restingFrame.width * 0.01, dy: restingFrame.height * 0.01)
-                panel.animator().setFrame(shrunk, display: true)
-            }
+            self?.panel.animator().alphaValue = 0
         }, completionHandler: { [weak self] in
             MainActor.assumeIsolated {
                 guard let self, self.isHiding else { return }
                 self.panel.orderOut(nil)
                 self.panel.alphaValue = 1
-                self.panel.setFrame(restingFrame, display: false)
+                self.panel.contentView?.layer?.removeAllAnimations()
                 self.isHiding = false
             }
         })
     }
 
-    /// Upper-center of the screen the cursor is on, keeping whatever size the user
-    /// last resized the panel to.
+    /// Scale about the layer's center plus a vertical offset ("rise" is toward
+    /// the bottom of the screen), compensating for the (0,0) anchor point.
+    private static func scaledTransform(for layer: CALayer, scale: CGFloat, rise: CGFloat, flipped: Bool) -> CATransform3D {
+        let bounds = layer.bounds
+        let dx = bounds.width * (1 - scale) / 2
+        let dy = bounds.height * (1 - scale) / 2 + (flipped ? rise : -rise)
+        var transform = CATransform3DMakeTranslation(dx, dy, 0)
+        transform = CATransform3DScale(transform, scale, scale, 1)
+        return transform
+    }
+
+    private static func transformAnimation(
+        from: CATransform3D,
+        to: CATransform3D,
+        duration: CFTimeInterval,
+        timing: CAMediaTimingFunction
+    ) -> CABasicAnimation {
+        let animation = CABasicAnimation(keyPath: "transform")
+        animation.fromValue = NSValue(caTransform3D: from)
+        animation.toValue = NSValue(caTransform3D: to)
+        animation.duration = duration
+        animation.timingFunction = timing
+        return animation
+    }
+
+    /// Where the user last dragged the panel (top-left, stable across the
+    /// top-anchored height changes); nil until they move it.
+    private var savedTopLeft: NSPoint? {
+        get {
+            let stored = UserDefaults.standard.string(forKey: "panelTopLeft")
+            let parts = (stored ?? "").split(separator: ",")
+            guard parts.count == 2, let x = Double(parts[0]), let y = Double(parts[1]) else { return nil }
+            return NSPoint(x: x, y: y)
+        }
+        set {
+            guard let point = newValue else { return }
+            UserDefaults.standard.set("\(point.x),\(point.y)", forKey: "panelTopLeft")
+        }
+    }
+
+    /// The user's last position when they've moved the panel (validated against
+    /// the current screens); otherwise slightly below the center of the screen
+    /// the cursor is on (user decision 2026-07-21 — overrides the design doc's
+    /// upper-center placement).
     private func position() {
+        let size = panel.frame.size
+        if let topLeft = savedTopLeft {
+            let frame = NSRect(x: topLeft.x, y: topLeft.y - size.height, width: size.width, height: size.height)
+            let onScreen = NSScreen.screens.contains { screen in
+                let intersection = frame.intersection(screen.visibleFrame)
+                return intersection.width >= 120 && intersection.height >= 80
+            }
+            if onScreen {
+                panel.setFrameOrigin(frame.origin)
+                return
+            }
+        }
         let mouse = NSEvent.mouseLocation
         let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) }
             ?? NSScreen.main
             ?? NSScreen.screens[0]
         let visible = screen.visibleFrame
-        let size = panel.frame.size
         let origin = NSPoint(
             x: visible.midX - size.width / 2,
-            y: visible.minY + visible.height * 0.72 - size.height / 2
+            y: visible.minY + visible.height * 0.45 - size.height / 2
         )
         panel.setFrameOrigin(origin)
     }
@@ -201,6 +275,15 @@ final class PanelController: NSObject, NSWindowDelegate {
                 self.hide()
             }
         }
+    }
+
+    // Fires for user drags (and for the top-anchored height changes, whose
+    // top-left is invariant, so saving is harmless). Programmatic positioning
+    // happens before the panel is visible and is excluded by the guard.
+    func windowDidMove(_ notification: Notification) {
+        guard panel.isVisible, !isHiding else { return }
+        let frame = panel.frame
+        savedTopLeft = NSPoint(x: frame.origin.x, y: frame.maxY)
     }
 
     func windowDidEndLiveResize(_ notification: Notification) {

@@ -163,17 +163,21 @@ final class ChatStore: ObservableObject {
                 guard let index = self.messages.firstIndex(where: { $0.id == messageID }) else { return }
                 let displayed = self.messages[index].text
                 let target = self.streamTarget
+                // Each tick re-renders and re-lays-out the growing message, and
+                // that cost scales with its length — so the tick rate adapts:
+                // fewer, larger steps for long texts, same ~180 chars/s feel.
+                let interval = target.count > 12_000 ? 100 : target.count > 4_000 ? 66 : 33
                 if displayed.count >= target.count {
                     if self.streamFinished { return }
                 } else if target.hasPrefix(displayed) {
                     let backlog = target.count - displayed.count
-                    let step = min(backlog, max(6, backlog / 12))
+                    let step = min(backlog, max(Int(Double(interval) * 0.18), backlog / 12))
                     self.messages[index].text = String(target.prefix(displayed.count + step))
                 } else {
                     // Non-monotonic snapshot (new tool round) — jump to it.
                     self.messages[index].text = target
                 }
-                try? await Task.sleep(for: .milliseconds(33))
+                try? await Task.sleep(for: .milliseconds(interval))
             }
         }
     }
