@@ -133,6 +133,19 @@ struct ComposerTextView: NSViewRepresentable {
             textView.string = text
             coordinator.remeasure()
         }
+        // Mode flip (⌘E morph): the same NSTextView is reused, so collapsing
+        // back to the capsule needs a fresh clamped measurement and the caret
+        // scrolled back into view — drafts longer than 8 lines return to the
+        // capsule's internal scroll.
+        if coordinator.lastFillsHeight != fillsHeight {
+            coordinator.lastFillsHeight = fillsHeight
+            if !fillsHeight {
+                coordinator.remeasure()
+                DispatchQueue.main.async {
+                    textView.scrollRangeToVisible(textView.selectedRange())
+                }
+            }
+        }
         if coordinator.lastFocusBump != focusBump {
             coordinator.lastFocusBump = focusBump
             DispatchQueue.main.async {
@@ -145,6 +158,7 @@ struct ComposerTextView: NSViewRepresentable {
         var parent: ComposerTextView
         weak var textView: NSTextView?
         var lastFocusBump = Int.min
+        var lastFillsHeight: Bool?
         private var lastHeight: CGFloat = -1
         private var widthObserver: NSObjectProtocol?
 
@@ -236,29 +250,15 @@ struct ComposerView: View {
     @AppStorage("webSearchEnabled") private var webEnabled = true
     @AppStorage("accentColor") private var accentHex = Theme.defaultAccentHex
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var accent: Color { Theme.color(accentHex) }
 
+    /// Chrome (title row, footer, side buttons) crossfades offset from the
+    /// geometry morph so it never smears with the spring.
+    private static let chromeFade = AnyTransition.opacity.animation(.easeOut(duration: 0.15))
+
     var body: some View {
-        Group {
-            if editorMode {
-                editorLayout
-            } else {
-                capsuleLayout
-            }
-        }
-        .onChange(of: draft) { _, _ in
-            if completionIndex != 0 { completionIndex = 0 }
-        }
-        .onChange(of: editorMode) { _, _ in onFocusRequest() }
-        .onReceive(NotificationCenter.default.publisher(for: .popChatAttachPasteboard)) { _ in
-            model.handlePasteboard()
-        }
-    }
-
-    // MARK: - Capsule mode
-
-    private var capsuleLayout: some View {
         VStack(spacing: 8) {
             if !completionCandidates.isEmpty {
                 slashCard
@@ -268,126 +268,160 @@ struct ComposerView: View {
                 attachCard
                     .transition(.opacity)
             }
-            inputCapsule
+            composerCard
+            if editorMode {
+                editorFooter
+                    .transition(Self.chromeFade)
+            }
         }
         .padding(.top, 10)
         .padding(.horizontal, 12)
         .padding(.bottom, 12)
+        .frame(maxHeight: editorMode ? .infinity : nil)
         .animation(.easeOut(duration: 0.12), value: completionCandidates.isEmpty)
         .animation(.easeOut(duration: 0.12), value: model.pendingAttachments.count)
         .animation(.easeOut(duration: 0.12), value: model.attachNotice)
+        // Capsule ↔ editor is ONE surface morphing (4d); under Reduce Motion the
+        // geometry snaps and only the chrome crossfade remains.
+        .animation(
+            reduceMotion ? .easeOut(duration: 0.15) : .spring(response: 0.32, dampingFraction: 0.82),
+            value: editorMode
+        )
+        .onChange(of: draft) { _, _ in
+            if completionIndex != 0 { completionIndex = 0 }
+        }
+        .onChange(of: editorMode) { _, _ in onFocusRequest() }
+        .onReceive(NotificationCenter.default.publisher(for: .popChatAttachPasteboard)) { _ in
+            model.handlePasteboard()
+        }
     }
 
-    private var inputCapsule: some View {
-        HStack(alignment: .bottom, spacing: 10) {
-            Group {
-                Button(action: attachViaPicker) {
-                    Image(systemName: "paperclip")
-                        .font(.system(size: 16))
+    // MARK: - The morphing surface (capsule ⇄ editor)
+
+    /// The input capsule and the ⌘E editor are the same glass card: same fill and
+    /// hairline, corner radius 21.5 (capsule) ⇄ 18 (editor). The text view sits at
+    /// a stable structural position in both modes, so AppKit keeps one NSTextView —
+    /// first responder, caret and undo stack survive the morph.
+    private var composerCard: some View {
+        VStack(spacing: 0) {
+            if editorMode {
+                HStack(spacing: 6) {
+                    Text("Draft")
+                        .font(.system(size: 11.5, weight: .semibold))
                         .foregroundStyle(.secondary)
-                        .frame(width: 24, height: 24)
-                        .contentShape(Circle())
+                    Spacer()
+                    Text("⌘E")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 4)
+                                .strokeBorder(Color.primary.opacity(0.18), lineWidth: 1)
+                        )
+                    Button {
+                        editorMode = false
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 16))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 24, height: 24)
+                            .contentShape(Circle())
+                    }
+                    .keyboardShortcut("e", modifiers: .command) // ⌘E toggles the editor
+                    .help("Close editor (⌘E or Esc)")
                 }
-                .help("Attach files (or drag & drop, or paste)")
-                Button {
-                    webEnabled.toggle()
-                } label: {
-                    Image(systemName: "globe")
-                        .font(.system(size: 16))
-                        .foregroundStyle(webEnabled ? accent : Color.secondary)
-                        .frame(width: 24, height: 24)
-                        .contentShape(Circle())
-                }
-                .help(webEnabled ? "Web access on — model may search and read pages" : "Web access off")
+                .padding(.top, 10)
+                .padding(.leading, 14)
+                .padding(.trailing, 10)
+                .transition(Self.chromeFade)
             }
-            composerField(fillsHeight: false)
-                .frame(height: inputHeight)
-                .padding(.vertical, 5)
-            Group {
-                Button {
-                    editorMode = true
-                } label: {
-                    Image(systemName: "arrow.up.left.and.arrow.down.right")
-                        .font(.system(size: 13))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 24, height: 24)
-                        .contentShape(Circle())
+            // Bottom alignment keeps the buttons on the LAST text line as the
+            // field grows. At one line the field row is 31pt (21 + 2×5) against
+            // 24pt icon slots — without compensation the icons sag 3.5pt below
+            // the text center. The bottom padding lifts each 24pt slot's center
+            // to 15.5pt from the row bottom: the text line's center, and level
+            // with the 30pt send slot (center 15).
+            HStack(alignment: .bottom, spacing: 10) {
+                if !editorMode {
+                    attachButton
+                        .padding(.bottom, 3.5)
+                        .transition(Self.chromeFade)
+                    globeButton
+                        .padding(.bottom, 3.5)
+                        .transition(Self.chromeFade)
                 }
-                .keyboardShortcut("e", modifiers: .command)
-                .help("Expand editor (⌘E)")
-                sendOrStopButton(size: 26)
+                composerField
+                    .frame(height: editorMode ? nil : inputHeight)
+                    .frame(maxHeight: editorMode ? .infinity : nil)
+                    .padding(.vertical, editorMode ? 8 : 5)
+                if !editorMode {
+                    Button {
+                        editorMode = true
+                    } label: {
+                        Image(systemName: "arrow.up.left.and.arrow.down.right")
+                            .font(.system(size: 16))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 24, height: 24)
+                            .contentShape(Circle())
+                    }
+                    .keyboardShortcut("e", modifiers: .command)
+                    .help("Expand editor (⌘E)")
+                    .padding(.bottom, 3.5)
+                    .transition(Self.chromeFade)
+                    sendOrStopButton(size: 26)
+                        .transition(Self.chromeFade)
+                }
             }
+            .padding(.horizontal, 14)
+            .padding(.top, editorMode ? 0 : 6)
+            .padding(.bottom, 6)
         }
         .buttonStyle(.plain)
-        .padding(.horizontal, 14)
-        .padding(.vertical, 6)
-        .glassCard(Capsule())
+        .glassCard(RoundedRectangle(cornerRadius: editorMode ? 18 : 21.5, style: .continuous))
     }
 
-    // MARK: - Editor mode
-
-    private var editorLayout: some View {
-        VStack(spacing: 8) {
-            HStack {
-                Text("Draft")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button {
-                    editorMode = false
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 16))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 22, height: 22)
-                        .contentShape(Circle())
-                }
-                .buttonStyle(.plain)
-                .keyboardShortcut("e", modifiers: .command) // ⌘E toggles the editor
-                .help("Close editor (⌘E or Esc)")
-            }
-            if !model.pendingAttachments.isEmpty || model.attachNotice != nil {
-                attachCard
-            }
-            composerField(fillsHeight: true)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .padding(10)
-                .glassCard(RoundedRectangle(cornerRadius: 16, style: .continuous))
-            HStack(spacing: 10) {
-                Button(action: attachViaPicker) {
-                    Image(systemName: "paperclip")
-                        .font(.system(size: 16))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 24, height: 24)
-                        .contentShape(Circle())
-                }
-                .help("Attach files")
-                Button {
-                    webEnabled.toggle()
-                } label: {
-                    Image(systemName: "globe")
-                        .font(.system(size: 16))
-                        .foregroundStyle(webEnabled ? accent : Color.secondary)
-                        .frame(width: 24, height: 24)
-                        .contentShape(Circle())
-                }
-                .help(webEnabled ? "Web access on" : "Web access off")
-                Spacer()
-                Text("↩ newline · ⌘↩ send")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(.tertiary)
-                sendOrStopButton(size: 26, sendShortcut: .init(.return, modifiers: .command))
-            }
-            .buttonStyle(.plain)
+    private var editorFooter: some View {
+        HStack(spacing: 10) {
+            attachButton
+            globeButton
+            Spacer()
+            Text("↩ newline · ⌘↩ send")
+                .font(.system(size: 10.5))
+                .foregroundStyle(.tertiary)
+            sendOrStopButton(size: 26, sendShortcut: .init(.return, modifiers: .command))
         }
-        .padding(12)
-        .frame(maxHeight: .infinity)
+        .buttonStyle(.plain)
     }
 
-    private func composerField(fillsHeight: Bool) -> some View {
+    private var attachButton: some View {
+        Button(action: attachViaPicker) {
+            Image(systemName: "paperclip")
+                .font(.system(size: 16))
+                .foregroundStyle(.secondary)
+                .frame(width: 24, height: 24)
+                .contentShape(Circle())
+        }
+        .help("Attach files (or drag & drop, or paste)")
+    }
+
+    private var globeButton: some View {
+        Button {
+            webEnabled.toggle()
+        } label: {
+            Image(systemName: "globe")
+                .font(.system(size: 16))
+                .foregroundStyle(webEnabled ? accent : Color.secondary)
+                .frame(width: 24, height: 24)
+                .contentShape(Circle())
+        }
+        .help(webEnabled ? "Web access on — model may search and read pages" : "Web access off")
+    }
+
+    private var composerField: some View {
         ComposerTextView(
             text: $draft,
-            fillsHeight: fillsHeight,
+            fillsHeight: editorMode,
             maxVisibleLines: 8,
             focusBump: focusBump,
             onHeightChange: { inputHeight = $0 },
@@ -578,6 +612,7 @@ private struct AttachmentChip: View {
         HStack(spacing: 5) {
             Image(systemName: icon)
                 .font(.system(size: 11))
+                .frame(width: 18, height: 18)
             Text(attachment.filename)
                 .font(.system(size: 11))
                 .lineLimit(1)
@@ -587,7 +622,7 @@ private struct AttachmentChip: View {
                     showNote.toggle()
                 } label: {
                     Image(systemName: attachment.noteKind == .warning ? "exclamationmark.triangle.fill" : "info.circle")
-                        .font(.system(size: 10))
+                        .font(.system(size: 11))
                         .foregroundStyle(attachment.noteKind == .warning ? Theme.warningOrange : Color.secondary)
                         .frame(width: 18, height: 18)
                         .contentShape(Circle())

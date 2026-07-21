@@ -29,10 +29,21 @@ struct ChatView: View {
     @State private var modelPillHovered = false
     @State private var actionPillHovered = false
     @State private var transcriptWidth: CGFloat = 680
+    /// Width of the header pills row — the model pill caps at 46% of it (4a).
+    @State private var headerWidth: CGFloat = 680
     /// Streaming follows the bottom only while the user is there; an upward
     /// scroll disengages so streaming never yanks the view.
     @State private var pinnedToBottom = true
     @State private var showNewMessagesPill = false
+    // ⌘F find-in-chat. Hits are counted over DISPLAYED text and painted in
+    // place (Find.swift); the transcript scrolls to the matched characters, not
+    // to the message. Only rows that contain a hit get a MessageFind, so every
+    // other row stays Equatable-gated while the query is typed, and highlights
+    // add only .backgroundColor — never a re-measure (see SelectableText).
+    @State private var findShown = false
+    @State private var findQuery = ""
+    @State private var findIndex = 0
+    @State private var findFocusBump = 0
     @AppStorage("accentColor") private var accentHex = Theme.defaultAccentHex
     @Environment(\.colorScheme) private var scheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -42,7 +53,7 @@ struct ChatView: View {
     var body: some View {
         VStack(spacing: 0) {
             mainContent
-            if store.messages.isEmpty {
+            if store.messages.isEmpty, !draftEditorShown {
                 Spacer(minLength: 0)
             }
         }
@@ -61,7 +72,9 @@ struct ChatView: View {
                     .allowsHitTesting(false)
             }
         }
-        .frame(minWidth: 480, minHeight: store.messages.isEmpty && !draftEditorShown ? nil : 320)
+        // No SwiftUI min frame here: the window enforces minimums (PanelController
+        // windowWillResize). A root larger than the window would render CENTERED
+        // in it, clipping the pills and composer off the top/bottom edges.
         .dropDestination(for: URL.self) { urls, _ in
             composerModel.handleFiles(urls)
             return true
@@ -69,6 +82,9 @@ struct ChatView: View {
             dropTargeted = targeted
         }
         .onExitCommand { onClose() }
+        // While the history popover is key, ITS ⌘F wins (popovers get their own
+        // window), which is what "⌘F in history searches the histories" means.
+        .keyCommand("f") { toggleFind() }
         .onChange(of: draftEditorShown) { _, shown in
             // The editor needs real height even when the chat is empty; the
             // compact preference resumes reporting when the editor closes.
@@ -80,14 +96,14 @@ struct ChatView: View {
 
     private var mainContent: some View {
         VStack(spacing: 0) {
-            if !draftEditorShown {
-                if store.messages.isEmpty {
-                    pillsRow
-                        .padding(12)
-                        .background(WindowDragStrip())
-                } else {
-                    transcriptZone
-                }
+            // The ⌘E editor keeps the header pills visible (4d); only the
+            // transcript hides while it's open.
+            if store.messages.isEmpty || draftEditorShown {
+                pillsRow
+                    .padding(12)
+                    .background(WindowDragStrip())
+            } else {
+                transcriptZone
             }
             ComposerView(
                 model: composerModel,
@@ -115,12 +131,21 @@ struct ChatView: View {
 
     // MARK: - Header pills
 
+    // Model pill caps at 46% of the row and truncates the id; the action
+    // cluster is fixedSize — it never compresses (4a).
     private var pillsRow: some View {
-        HStack {
+        HStack(spacing: 10) {
             modelPill
-            Spacer()
+            Spacer(minLength: 0)
             actionPill
+                .fixedSize()
         }
+        .background(
+            GeometryReader { geometry in
+                Color.clear.preference(key: HeaderWidthKey.self, value: geometry.size.width)
+            }
+        )
+        .onPreferenceChange(HeaderWidthKey.self) { headerWidth = $0 }
     }
 
     private var modelPill: some View {
@@ -163,12 +188,22 @@ struct ChatView: View {
                 }
                 .disabled(providerStore.isFetchingModels)
             }
+            Divider()
+            // The real ⌘, lives in the invisible app menu (AppDelegate); inside a
+            // pull-down menu the modifier only renders as a hint, so no double-fire.
+            Button("Settings…") {
+                NotificationCenter.default.post(name: .popChatOpenSettings, object: nil)
+            }
+            .keyboardShortcut(",", modifiers: .command)
         } label: {
             HStack(spacing: 4) {
                 Text(switcherLabel)
                     .font(.system(size: 11.5, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
                 Image(systemName: "chevron.down")
                     .font(.system(size: 8, weight: .semibold))
+                    .layoutPriority(1)
             }
             .foregroundStyle(.secondary)
             .padding(.horizontal, 11)
@@ -179,24 +214,31 @@ struct ChatView: View {
         }
         .menuStyle(.button)
         .buttonStyle(.plain)
-        .fixedSize()
+        .fixedSize(horizontal: false, vertical: true)
         .pillBackground(hovered: modelPillHovered)
         .onHover { modelPillHovered = $0 }
+        // Invisible cap: the visible pill hugs its content, but never exceeds
+        // 46% of the header row (the label truncates instead).
+        .frame(maxWidth: max(headerWidth * 0.46, 140), alignment: .leading)
     }
 
+    // Icon grid (4b): 14pt symbols in fixed 20×20 slots, 8pt gap, 4×8 padding
+    // ≙ 28pt capsule height; active states are plain circular fills over the
+    // slot — no negative margins.
     private var actionPill: some View {
-        HStack(spacing: 14) {
+        HStack(spacing: 8) {
             Button {
                 historyShown.toggle()
             } label: {
                 Image(systemName: "clock.arrow.circlepath")
                     .font(.system(size: 14))
-                    .frame(width: 24, height: 24)
+                    .frame(width: 20, height: 20)
                     .background(historyShown ? Color.primary.opacity(0.14) : .clear, in: Circle())
                     .contentShape(Circle())
             }
             .buttonStyle(.plain)
-            .help("Recent chats")
+            .keyboardShortcut("y", modifiers: .command)
+            .help("Recent chats (⌘Y)")
             .popover(isPresented: $historyShown, arrowEdge: .bottom) {
                 HistoryPopover(store: store)
             }
@@ -205,7 +247,7 @@ struct ChatView: View {
             } label: {
                 Image(systemName: "square.and.pencil")
                     .font(.system(size: 14))
-                    .frame(width: 24, height: 24)
+                    .frame(width: 20, height: 20)
                     .contentShape(Circle())
             }
             .buttonStyle(.plain)
@@ -217,12 +259,13 @@ struct ChatView: View {
                 Image(systemName: state.pinned ? "pin.fill" : "pin")
                     .font(.system(size: 14))
                     .contentTransition(.symbolEffect(.replace))
-                    .frame(width: 24, height: 24)
+                    .frame(width: 20, height: 20)
                     .background(state.pinned ? Color.primary.opacity(0.14) : .clear, in: Circle())
                     .contentShape(Circle())
             }
             .buttonStyle(.plain)
-            .help(state.pinned ? "Unpin — hide when clicking away" : "Keep on top")
+            .keyboardShortcut("p", modifiers: .command)
+            .help(state.pinned ? "Unpin — hide when clicking away (⌘P)" : "Keep on top (⌘P)")
             .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: state.pinned)
         }
         .foregroundStyle(.secondary)
@@ -243,6 +286,10 @@ struct ChatView: View {
     private var transcriptZone: some View {
         let streamingID = store.isStreaming ? store.messages.last(where: { $0.role == .assistant })?.id : nil
         let bubbleMaxWidth = max(220, (transcriptWidth - 32) * 0.78)
+        let hits = findShown ? findHits : []
+        let activeHit = hits.indices.contains(findIndex) ? hits[findIndex] : nil
+        let matchedIDs = Set(hits.map(\.messageID))
+        let query = findQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         return ScrollViewReader { proxy in
             trackingBottomPin(
                 ScrollView {
@@ -256,6 +303,14 @@ struct ChatView: View {
                                 message: message,
                                 showCaret: message.id == streamingID,
                                 bubbleMaxWidth: bubbleMaxWidth,
+                                // Nil for messages with no hit, so every other
+                                // row stays Equatable-gated while typing.
+                                find: matchedIDs.contains(message.id)
+                                    ? MessageFind(
+                                        query: query,
+                                        activeOccurrence: activeHit?.messageID == message.id ? activeHit?.occurrence : nil
+                                    )
+                                    : nil,
                                 onFork: { store.fork(at: message.id) }
                             )
                             .equatable()
@@ -276,9 +331,29 @@ struct ChatView: View {
             .onPreferenceChange(TranscriptWidthKey.self) { transcriptWidth = $0 }
             .mask(topFade)
             .overlay(alignment: .top) {
-                pillsRow
-                    .padding(12)
-                    .background(WindowDragStrip())
+                VStack(spacing: 0) {
+                    pillsRow
+                        .padding(12)
+                        .background(WindowDragStrip())
+                    if findShown {
+                        findBar(matchCount: hits.count)
+                            .padding(.horizontal, 12)
+                            .padding(.bottom, 8)
+                            .transition(.opacity)
+                    }
+                }
+            }
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: findShown)
+            // Recompute from state rather than closing over `currentMatch`: the
+            // captured value belongs to the body evaluation that installed the
+            // closure, which is not guaranteed to be the post-change one.
+            .onChange(of: findIndex) { _, index in
+                let hits = findHits
+                scrollToMatch(hits.indices.contains(index) ? hits[index] : nil, proxy)
+            }
+            .onChange(of: findQuery) { _, _ in
+                findIndex = 0
+                scrollToMatch(findHits.first, proxy)
             }
             .overlay(alignment: .bottom) {
                 if showNewMessagesPill {
@@ -311,6 +386,133 @@ struct ChatView: View {
                 if pinned { showNewMessagesPill = false }
             }
         }
+    }
+
+    // MARK: - Find in chat (⌘F)
+
+    /// Every occurrence in the transcript, in reading order. Counted over
+    /// DISPLAYED text (markdown syntax stripped, code/table content as rendered)
+    /// so hit N is exactly the range the transcript paints as active.
+    private var findHits: [FindHit] {
+        let query = findQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return [] }
+        var hits: [FindHit] = []
+        for message in store.messages {
+            let count = MarkdownRenderer.searchableStrings(for: message)
+                .reduce(0) { $0 + FindHighlight.count(in: $1, query: query) }
+            for occurrence in 0..<count {
+                hits.append(FindHit(messageID: message.id, occurrence: occurrence))
+            }
+        }
+        return hits
+    }
+
+    private func toggleFind() {
+        if findShown {
+            closeFind()
+        } else {
+            guard !store.messages.isEmpty else { return } // nothing to search
+            findShown = true
+            findIndex = 0
+            findFocusBump += 1
+        }
+    }
+
+    private func closeFind() {
+        findShown = false
+        findQuery = ""
+        findIndex = 0
+        state.focusBump += 1 // hand the caret back to the composer
+    }
+
+    private func stepMatch(_ delta: Int) {
+        let count = findHits.count
+        guard count > 0 else { return }
+        findIndex = ((findIndex + delta) % count + count) % count // wraps both ways
+    }
+
+    /// Coarse fallback only. Rows that render real text views scroll themselves
+    /// to the matched characters (`SelectableText.reveal`) — scrolling to the
+    /// message here as well would fight that with a second, less precise jump.
+    private func scrollToMatch(_ hit: FindHit?, _ proxy: ScrollViewProxy) {
+        guard let hit,
+              let message = store.messages.first(where: { $0.id == hit.messageID }),
+              message.role == .activity || message.role == .error else { return }
+        proxy.scrollTo(hit.messageID, anchor: .center)
+    }
+
+    private func findBar(matchCount: Int) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            KeyRoutingTextField(
+                text: $findQuery,
+                placeholder: "Find in chat",
+                focusBump: findFocusBump,
+                onMoveUp: {
+                    stepMatch(-1)
+                    return true
+                },
+                onMoveDown: {
+                    stepMatch(1)
+                    return true
+                },
+                onReturn: { shift in
+                    stepMatch(shift ? -1 : 1)
+                    return true
+                },
+                onEscape: {
+                    closeFind()
+                    return true
+                }
+            )
+            .frame(height: 16)
+            Text(matchLabel(matchCount))
+                .font(.system(size: 10.5))
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .fixedSize()
+            findStepButton("chevron.up", modifiers: [.command, .shift], enabled: matchCount > 0) { stepMatch(-1) }
+            findStepButton("chevron.down", modifiers: .command, enabled: matchCount > 0) { stepMatch(1) }
+            Button(action: closeFind) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .semibold))
+                    .frame(width: 18, height: 18)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("Close find (⎋)")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .pillBackground()
+    }
+
+    private func matchLabel(_ count: Int) -> String {
+        if findQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "" }
+        guard count > 0 else { return "No matches" }
+        return "\(min(findIndex + 1, count)) of \(count)"
+    }
+
+    private func findStepButton(
+        _ symbol: String,
+        modifiers: EventModifiers,
+        enabled: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 10, weight: .semibold))
+                .frame(width: 18, height: 18)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .disabled(!enabled)
+        .keyboardShortcut("g", modifiers: modifiers)
+        .help(symbol == "chevron.up" ? "Previous match (⇧⌘G)" : "Next match (⌘G)")
     }
 
     /// Transcript scrolls under the pills; the top 44pt fades out beneath them.
@@ -352,7 +554,8 @@ struct ChatView: View {
     }
 
     private func newMessagesPill(_ proxy: ScrollViewProxy) -> some View {
-        Button {
+        let dark = scheme == .dark
+        return Button {
             showNewMessagesPill = false
             withAnimation(.easeOut(duration: 0.25)) { proxy.scrollTo("bottom", anchor: .bottom) }
         } label: {
@@ -362,13 +565,22 @@ struct ChatView: View {
                     .foregroundStyle(accent)
                 Text("New messages")
                     .font(.system(size: 11.5, weight: .medium))
-                    .foregroundStyle(Theme.color("#f5f5f7"))
+                    .foregroundStyle(dark ? Theme.color("#f5f5f7") : Theme.color("#1d1d1f"))
             }
             .padding(.vertical, 6)
             .padding(.horizontal, 13)
-            .background(Theme.color("#2C2C30").opacity(0.95), in: Capsule())
-            .overlay(Capsule().strokeBorder(Color.white.opacity(0.16), lineWidth: 0.5))
-            .shadow(color: .black.opacity(0.4), radius: 12, y: 8)
+            .background(
+                dark ? Theme.color("#2C2C30").opacity(0.95) : Theme.color("#FCFCFE").opacity(0.97),
+                in: Capsule()
+            )
+            .overlay(Capsule().strokeBorder(
+                dark ? Color.white.opacity(0.16) : Color.black.opacity(0.10),
+                lineWidth: 0.5
+            ))
+            .shadow(
+                color: dark ? .black.opacity(0.4) : Theme.color("#282850").opacity(0.18),
+                radius: 12, y: 8
+            )
         }
         .buttonStyle(.plain)
     }
@@ -393,6 +605,13 @@ private struct TranscriptWidthKey: PreferenceKey {
     }
 }
 
+private struct HeaderWidthKey: PreferenceKey {
+    static let defaultValue: CGFloat = 680
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 /// Equatable so unchanged rows skip body re-evaluation entirely during
 /// streaming ticks and keystrokes — no markdown segmentation, no
 /// attributed-string rebuilds, no measurement.
@@ -400,6 +619,9 @@ private struct MessageRow: View, Equatable {
     let message: ChatMessage
     let showCaret: Bool
     let bubbleMaxWidth: CGFloat
+    /// Nil unless this message contains a ⌘F hit. Part of ==, so a row repaints
+    /// when its own highlights change and stays gated otherwise.
+    var find: MessageFind?
     /// Ignored by ==: it captures only stable references (store + message id).
     var onFork: () -> Void = {}
 
@@ -408,9 +630,16 @@ private struct MessageRow: View, Equatable {
     @Environment(\.colorScheme) private var scheme
     @State private var copied = false
 
+    /// Single-text-view rows (user bubble, activity, error) render one string,
+    /// so the message's occurrence numbering IS the view's.
+    private var textFind: TextFind? {
+        find.map { TextFind(query: $0.query, active: $0.activeOccurrence) }
+    }
+
     static func == (lhs: MessageRow, rhs: MessageRow) -> Bool {
         lhs.message == rhs.message
             && lhs.showCaret == rhs.showCaret
+            && lhs.find == rhs.find
             && abs(lhs.bubbleMaxWidth - rhs.bubbleMaxWidth) < 0.5
     }
 
@@ -429,10 +658,13 @@ private struct MessageRow: View, Equatable {
                         }
                     }
                     if !message.text.isEmpty {
-                        SelectableText(attributed: MarkdownRenderer.plain(
-                            message.text,
-                            color: style == .accentFill ? .white : .labelColor
-                        ))
+                        SelectableText(
+                            attributed: MarkdownRenderer.plain(
+                                message.text,
+                                color: style == .accentFill ? .white : .labelColor
+                            ),
+                            find: textFind
+                        )
                     }
                 }
                 .padding(.vertical, 9)
@@ -446,7 +678,7 @@ private struct MessageRow: View, Equatable {
             .frame(maxWidth: .infinity, alignment: .trailing)
         case .assistant:
             VStack(alignment: .leading, spacing: 4) {
-                AssistantMessageView(text: message.text, showCaret: showCaret)
+                AssistantMessageView(text: message.text, showCaret: showCaret, find: find)
                 // Always visible once the response is complete; occupies its
                 // space during streaming (opacity only) so finishing never
                 // reflows the transcript.
@@ -486,12 +718,16 @@ private struct MessageRow: View, Equatable {
                 Button("Fork Here", action: onFork)
             }
         case .activity:
-            Label(message.text, systemImage: "sparkles")
+            Label { Text(FindHighlight.paint(message.text, find: textFind)) } icon: {
+                Image(systemName: "sparkles")
+            }
                 .font(.system(size: 11))
                 .foregroundStyle(.primary.opacity(0.5))
                 .frame(maxWidth: .infinity, alignment: .leading)
         case .error:
-            Label(message.text, systemImage: "exclamationmark.triangle.fill")
+            Label { Text(FindHighlight.paint(message.text, find: textFind)) } icon: {
+                Image(systemName: "exclamationmark.triangle.fill")
+            }
                 .font(.callout)
                 .foregroundStyle(.red)
                 .textSelection(.enabled)

@@ -11,6 +11,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var settingsWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Auto / Light / Dark (Settings › General): NSApp.appearance reaches every
+        // window at once — panel, Settings, popovers; nil follows the system.
+        AppearanceChoice.applyCurrent()
         installMainMenu()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem.button {

@@ -150,6 +150,50 @@ enum MarkdownRenderer {
         return cells
     }
 
+    // MARK: - Search
+
+    /// The strings ⌘F searches, in the exact order their views render: prose and
+    /// quotes with markdown syntax already stripped (so a hit lands where the
+    /// user sees the text, not where the source has it), code/pasteable content
+    /// verbatim, table cells header-first then row by row. Display math is a
+    /// rendered bitmap and has no searchable text.
+    ///
+    /// `FindCursor` walks this same order when handing out highlight contexts —
+    /// if one side changes, the other must change with it.
+    static func searchableStrings(_ segment: Segment) -> [String] {
+        switch segment {
+        case .prose(let prose): return [attributedProse(prose).string]
+        case .quote(let quote): return [attributedProse(quote).string]
+        case .code(_, let content): return [content]
+        case .pasteable(_, let content): return [content]
+        case .table(let header, let rows): return header.map { tableCell($0).string } + rows.flatMap { $0.map { tableCell($0).string } }
+        case .math: return []
+        }
+    }
+
+    /// A table cell's rendered text (inline markdown only). Lives here so search
+    /// and rendering measure the same string.
+    static func tableCell(_ text: String, bold: Bool = false) -> NSAttributedString {
+        let font = bold ? NSFont.boldSystemFont(ofSize: 12) : NSFont.systemFont(ofSize: 12)
+        guard let parsed = try? AttributedString(
+            markdown: text,
+            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        ) else {
+            return NSAttributedString(string: text, attributes: [.font: font, .foregroundColor: NSColor.labelColor])
+        }
+        let result = NSMutableAttributedString(attributedString: NSAttributedString(parsed))
+        result.addAttributes([.font: font, .foregroundColor: NSColor.labelColor],
+                             range: NSRange(location: 0, length: result.length))
+        return result
+    }
+
+    static func searchableStrings(for message: ChatMessage) -> [String] {
+        switch message.role {
+        case .assistant: return segments(message.text).flatMap(searchableStrings)
+        case .user, .activity, .error: return [message.text]
+        }
+    }
+
     // MARK: - Prose → NSAttributedString
 
     // Bounded: streaming produces a new string per tick, so uncapped caches would
@@ -160,13 +204,21 @@ enum MarkdownRenderer {
         return cache
     }()
 
+    /// The current appearance is part of every render-cache key: label colors are
+    /// dynamic and resolve at draw time, but math images are BITMAPS with the
+    /// color baked in — an Auto/Light/Dark flip (4f) must not serve stale ones.
+    private static var appearanceKey: String {
+        NSApp?.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .aqua ? "l" : "d"
+    }
+
     static func attributedProse(_ markdown: String, caret: NSColor? = nil) -> NSAttributedString {
         let base: NSAttributedString
-        if let cached = proseCache.object(forKey: markdown as NSString) {
+        let cacheKey = "\(appearanceKey)|\(markdown)" as NSString
+        if let cached = proseCache.object(forKey: cacheKey) {
             base = cached
         } else {
             base = buildProse(markdown)
-            proseCache.setObject(base, forKey: markdown as NSString)
+            proseCache.setObject(base, forKey: cacheKey)
         }
         guard let caret else { return base }
         let withCaret = NSMutableAttributedString(attributedString: base)
@@ -304,12 +356,12 @@ enum MarkdownRenderer {
         return result.length > 0 ? result : plain(markdown)
     }
 
-    static func plain(_ text: String, monospaced: Bool = false, color: NSColor = .labelColor) -> NSAttributedString {
+    static func plain(_ text: String, monospaced: Bool = false, color: NSColor = .labelColor, size: CGFloat? = nil) -> NSAttributedString {
         let paragraph = NSMutableParagraphStyle()
         paragraph.lineSpacing = monospaced ? 4 : 3
         let font = monospaced
-            ? NSFont.monospacedSystemFont(ofSize: 11.5, weight: .regular)
-            : NSFont.systemFont(ofSize: NSFont.systemFontSize)
+            ? NSFont.monospacedSystemFont(ofSize: size ?? 11.5, weight: .regular)
+            : NSFont.systemFont(ofSize: size ?? NSFont.systemFontSize)
         return NSAttributedString(string: text, attributes: [
             .font: font,
             .foregroundColor: color,
@@ -317,9 +369,9 @@ enum MarkdownRenderer {
         ])
     }
 
-    // MARK: - Syntax highlighting (Splash, Xcode-dark palette)
+    // MARK: - Syntax highlighting (Splash — Xcode dark/light palettes, 4f)
 
-    private static let splashTheme = Splash.Theme(
+    private static let splashDarkTheme = Splash.Theme(
         font: Splash.Font(size: 11.5),
         plainTextColor: Theme.nsColor("#DFDFE6"),
         tokenColors: [
@@ -335,15 +387,34 @@ enum MarkdownRenderer {
         ],
         backgroundColor: .clear
     )
-    private static let highlighter = SyntaxHighlighter(format: AttributedStringOutputFormat(theme: splashTheme))
+    private static let splashLightTheme = Splash.Theme(
+        font: Splash.Font(size: 11.5),
+        plainTextColor: Theme.nsColor("#262629"),
+        tokenColors: [
+            .keyword: Theme.nsColor("#AD3DA4"),
+            .type: Theme.nsColor("#0B4F79"),
+            .call: Theme.nsColor("#326D74"),
+            .property: Theme.nsColor("#326D74"),
+            .dotAccess: Theme.nsColor("#326D74"),
+            .number: Theme.nsColor("#1C00CF"),
+            .comment: Theme.nsColor("#5D6C79"),
+            .string: Theme.nsColor("#D12F1B"),
+            .preprocessing: Theme.nsColor("#78492A"),
+        ],
+        backgroundColor: .clear
+    )
+    private static let darkHighlighter = SyntaxHighlighter(format: AttributedStringOutputFormat(theme: splashDarkTheme))
+    private static let lightHighlighter = SyntaxHighlighter(format: AttributedStringOutputFormat(theme: splashLightTheme))
     private static let codeCache: NSCache<NSString, NSAttributedString> = {
         let cache = NSCache<NSString, NSAttributedString>()
         cache.countLimit = 64
         return cache
     }()
 
-    static func highlightedCode(_ code: String) -> NSAttributedString {
-        if let cached = codeCache.object(forKey: code as NSString) { return cached }
+    static func highlightedCode(_ code: String, dark: Bool = true) -> NSAttributedString {
+        let key = "\(dark ? "d" : "l")|\(code)" as NSString
+        if let cached = codeCache.object(forKey: key) { return cached }
+        let highlighter = dark ? darkHighlighter : lightHighlighter
         let highlighted = NSMutableAttributedString(attributedString: highlighter.highlight(code))
         let paragraph = NSMutableParagraphStyle()
         paragraph.lineSpacing = 4
@@ -351,7 +422,7 @@ enum MarkdownRenderer {
             .font: NSFont.monospacedSystemFont(ofSize: 11.5, weight: .regular),
             .paragraphStyle: paragraph,
         ], range: NSRange(location: 0, length: highlighted.length))
-        codeCache.setObject(highlighted, forKey: code as NSString)
+        codeCache.setObject(highlighted, forKey: key)
         return highlighted
     }
 
@@ -364,7 +435,7 @@ enum MarkdownRenderer {
     }()
 
     static func mathImage(_ latex: String, fontSize: CGFloat, display: Bool) -> NSImage? {
-        let key = "\(display ? "d" : "t")|\(fontSize)|\(latex)" as NSString
+        let key = "\(appearanceKey)|\(display ? "d" : "t")|\(fontSize)|\(latex)" as NSString
         if let cached = mathCache.object(forKey: key) { return cached }
         let renderer = MTMathImage(
             latex: latex,
@@ -437,6 +508,11 @@ enum MarkdownRenderer {
 struct SelectableText: NSViewRepresentable {
     let attributed: NSAttributedString
     var wraps = true
+    /// Live ⌘F state for THIS view's text. Highlights add only
+    /// `.backgroundColor`, which cannot change metrics — so `sizeThatFits` keeps
+    /// keying on the UNPAINTED `attributed` and typing in the find field never
+    /// re-measures the transcript.
+    var find: TextFind?
 
     /// Number of actual CoreText measurements performed (cache misses).
     /// Read by the --smoke-typing harness; main-thread only.
@@ -451,12 +527,20 @@ struct SelectableText: NSViewRepresentable {
         var cachedAttributed: NSAttributedString?
         var cachedWraps: Bool?
         var sizes: [CGFloat: CGSize] = [:]
+        /// Last hit this view scrolled to — re-renders must not yank the
+        /// transcript back to a match the user has already stepped past.
+        var lastRevealed: String?
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
+    private var displayed: NSAttributedString {
+        guard let find else { return attributed }
+        return FindHighlight.paint(attributed, find: find)
+    }
+
     func makeNSView(context: Context) -> NSTextField {
-        let field = NSTextField(labelWithAttributedString: attributed)
+        let field = NSTextField(labelWithAttributedString: displayed)
         field.isSelectable = true
         field.allowsEditingTextAttributes = true // required for clickable links
         field.lineBreakMode = wraps ? .byWordWrapping : .byClipping
@@ -468,10 +552,70 @@ struct SelectableText: NSViewRepresentable {
     }
 
     func updateNSView(_ field: NSTextField, context: Context) {
-        if field.attributedStringValue != attributed {
-            field.attributedStringValue = attributed
+        let display = displayed
+        if field.attributedStringValue != display {
+            field.attributedStringValue = display
+        }
+        revealActiveMatch(in: field, coordinator: context.coordinator)
+    }
+
+    private func revealActiveMatch(in field: NSTextField, coordinator: Coordinator) {
+        guard let find, let active = find.active else {
+            coordinator.lastRevealed = nil
+            return
+        }
+        let key = "\(find.query)#\(active)"
+        guard coordinator.lastRevealed != key else { return }
+        coordinator.lastRevealed = key
+        let matches = FindHighlight.ranges(in: attributed.string, query: find.query)
+        guard matches.indices.contains(active) else { return }
+        let range = matches[active]
+        let text = attributed
+        let shouldWrap = wraps
+        // After the layout pass that this update belongs to: the field may not
+        // have its final width yet, and scrolling mid-layout fights SwiftUI.
+        DispatchQueue.main.async { Self.reveal(range: range, of: text, wraps: shouldWrap, in: field) }
+    }
+
+    /// Scrolls so the matched CHARACTERS are on screen — not the message, which
+    /// can be pages long. The range is laid out at the field's own width, then
+    /// padded on top so the hit can't land under the header pills or find bar.
+    private static func reveal(range: NSRange, of attributed: NSAttributedString, wraps: Bool, in field: NSTextField) {
+        let width = field.bounds.width
+        guard width > 1 else { return }
+        let storage = NSTextStorage(attributedString: attributed)
+        let manager = NSLayoutManager()
+        let container = NSTextContainer(size: NSSize(
+            width: wraps ? width : .greatestFiniteMagnitude,
+            height: .greatestFiniteMagnitude
+        ))
+        container.lineFragmentPadding = 0
+        manager.addTextContainer(container)
+        storage.addLayoutManager(manager)
+        manager.ensureLayout(for: container)
+        let glyphs = manager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+        let bounds = manager.boundingRect(forGlyphRange: glyphs, in: container)
+        // NSTextField lays text out top-down even though the view isn't flipped.
+        let top = field.isFlipped ? bounds.minY : field.bounds.height - bounds.maxY
+        let padded = NSRect(
+            x: bounds.minX,
+            y: top - revealTopInset,
+            width: max(bounds.width, 1),
+            height: bounds.height + revealTopInset + revealBottomInset
+        )
+        // Every enclosing scroller, innermost first: a hit inside a code block
+        // has to move the block's horizontal scroller AND the transcript.
+        var walker: NSView = field
+        while let scroll = walker.enclosingScrollView {
+            if let document = scroll.documentView {
+                document.scrollToVisible(field.convert(padded, to: document))
+            }
+            walker = scroll
         }
     }
+
+    private static let revealTopInset: CGFloat = 96 // header pills + find bar
+    private static let revealBottomInset: CGFloat = 48
 
     func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSTextField, context: Context) -> CGSize? {
         // Deterministic for every proposal (nil/zero/infinite all measure as a
@@ -510,38 +654,54 @@ struct SelectableText: NSViewRepresentable {
 struct AssistantMessageView: View {
     let text: String
     var showCaret = false
+    var find: MessageFind?
 
     @AppStorage("accentColor") private var accentHex = Theme.defaultAccentHex
 
     var body: some View {
         let segments = MarkdownRenderer.segments(text)
+        let finds = segmentFinds(segments)
         VStack(alignment: .leading, spacing: 8) {
             ForEach(Array(segments.enumerated()), id: \.offset) { index, segment in
+                let segmentFind = finds[index].first ?? nil
                 switch segment {
                 case .prose(let prose):
                     // While streaming, the last prose segment carries a steady
                     // (non-blinking) inline caret — a timer-driven blink here would
                     // re-evaluate and re-layout the transcript on every tick.
-                    SelectableText(attributed: MarkdownRenderer.attributedProse(
-                        prose,
-                        caret: showCaret && index == segments.count - 1 ? Theme.nsColor(accentHex) : nil
-                    ))
+                    SelectableText(
+                        attributed: MarkdownRenderer.attributedProse(
+                            prose,
+                            caret: showCaret && index == segments.count - 1 ? Theme.nsColor(accentHex) : nil
+                        ),
+                        find: segmentFind
+                    )
                 case .code(let language, let content):
-                    CodeBlockView(language: language, content: content)
+                    CodeBlockView(language: language, content: content, find: segmentFind)
                 case .quote(let quote):
-                    QuoteBlockView(text: quote)
+                    QuoteBlockView(text: quote, find: segmentFind)
                 case .table(let header, let rows):
-                    TableBlockView(header: header, rows: rows)
+                    TableBlockView(header: header, rows: rows, cellFinds: finds[index])
                 case .math(let latex):
                     MathBlockView(latex: latex)
                 case .pasteable(let title, let content):
-                    PasteableBlockView(title: title, content: content)
+                    PasteableBlockView(title: title, content: content, find: segmentFind)
                 }
             }
             if showCaret, !(segments.last?.isProse ?? false) {
                 BlinkingCaret(color: Theme.color(accentHex))
             }
         }
+    }
+
+    /// One highlight context per text view, walked in the same order
+    /// `MarkdownRenderer.searchableStrings` counts occurrences — that shared
+    /// order is what keeps "7 of 12" pointing at the range actually painted.
+    /// Segments with no match yield nil, so their attributed strings stay
+    /// identical and the render/measurement caches keep hitting.
+    private func segmentFinds(_ segments: [MarkdownRenderer.Segment]) -> [[TextFind?]] {
+        guard var cursor = FindCursor(find) else { return segments.map { _ in [nil] } }
+        return segments.map { cursor.next(all: MarkdownRenderer.searchableStrings($0)) }
     }
 }
 
@@ -567,16 +727,21 @@ private struct BlinkingCaret: View {
 struct CodeBlockView: View {
     let language: String?
     let content: String
+    var find: TextFind?
 
     @State private var copied = false
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
+        // Recessed surface (4f): dark = black 35% with the Xcode-dark palette,
+        // light = black 5% with the Xcode-light palette — the block recesses in
+        // both modes instead of staying a dark slab on a light panel.
+        let dark = scheme == .dark
         VStack(alignment: .leading, spacing: 0) {
             HStack {
                 Text(language ?? "code")
                     .font(.system(size: 10.5))
-                    .foregroundStyle(Color(nsColor: Theme.nsColor("#DFDFE6")).opacity(0.5))
+                    .foregroundStyle(Theme.recessedCaption(dark: dark))
                 Spacer()
                 Button {
                     NSPasteboard.general.clearContents()
@@ -586,7 +751,7 @@ struct CodeBlockView: View {
                 } label: {
                     Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
                         .font(.system(size: 10.5))
-                        .foregroundStyle(Color(nsColor: Theme.nsColor("#DFDFE6")).opacity(0.5))
+                        .foregroundStyle(Theme.recessedCaption(dark: dark))
                         .padding(.vertical, 3)
                         .contentShape(Rectangle())
                 }
@@ -594,29 +759,29 @@ struct CodeBlockView: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 5)
-            .background(Color.white.opacity(0.04))
+            .background(Theme.recessedHeader(dark: dark))
             ScrollView(.horizontal, showsIndicators: false) {
-                SelectableText(attributed: MarkdownRenderer.highlightedCode(content), wraps: false)
+                SelectableText(attributed: MarkdownRenderer.highlightedCode(content, dark: dark), wraps: false, find: find)
                     .padding(10)
             }
         }
-        // The Xcode-dark palette needs a dark backdrop in both appearances.
-        .background(Color.black.opacity(scheme == .dark ? 0.35 : 0.78))
+        .background(Theme.recessedFill(dark: dark))
         .clipShape(RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.white.opacity(0.08), lineWidth: 0.5))
+        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Theme.recessedBorder(dark: dark), lineWidth: 0.5))
         .padding(.vertical, 2)
     }
 }
 
 struct QuoteBlockView: View {
     let text: String
+    var find: TextFind?
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             RoundedRectangle(cornerRadius: 1)
                 .fill(Color.primary.opacity(0.3))
                 .frame(width: 2)
-            SelectableText(attributed: MarkdownRenderer.attributedProse(text))
+            SelectableText(attributed: MarkdownRenderer.attributedProse(text), find: find)
                 .opacity(0.65)
         }
     }
@@ -625,12 +790,14 @@ struct QuoteBlockView: View {
 struct TableBlockView: View {
     let header: [String]
     let rows: [[String]]
+    /// One entry per cell, in `MarkdownRenderer.searchableStrings` order.
+    var cellFinds: [TextFind?] = []
 
     var body: some View {
         Grid(alignment: .topLeading, horizontalSpacing: 0, verticalSpacing: 0) {
             GridRow {
-                ForEach(Array(header.enumerated()), id: \.offset) { _, cell in
-                    cellView(cell, header: true)
+                ForEach(Array(header.enumerated()), id: \.offset) { column, cell in
+                    cellView(cell, header: true, find: cellFind(row: nil, column: column))
                 }
             }
             Rectangle()
@@ -639,8 +806,8 @@ struct TableBlockView: View {
                 .gridCellColumns(max(header.count, 1))
             ForEach(Array(rows.enumerated()), id: \.offset) { rowIndex, row in
                 GridRow {
-                    ForEach(Array(row.enumerated()), id: \.offset) { _, cell in
-                        cellView(cell, header: false)
+                    ForEach(Array(row.enumerated()), id: \.offset) { column, cell in
+                        cellView(cell, header: false, find: cellFind(row: rowIndex, column: column))
                     }
                 }
                 if rowIndex < rows.count - 1 {
@@ -654,48 +821,53 @@ struct TableBlockView: View {
         .padding(.vertical, 2)
     }
 
-    private func cellView(_ text: String, header: Bool) -> some View {
-        SelectableText(attributed: inlineAttributed(text, bold: header))
+    private func cellView(_ text: String, header: Bool, find: TextFind?) -> some View {
+        SelectableText(attributed: MarkdownRenderer.tableCell(text, bold: header), find: find)
             .padding(.horizontal, 10)
             .padding(.vertical, 5)
     }
 
-    private func inlineAttributed(_ text: String, bold: Bool) -> NSAttributedString {
-        let font = bold ? NSFont.boldSystemFont(ofSize: 12) : NSFont.systemFont(ofSize: 12)
-        guard let parsed = try? AttributedString(
-            markdown: text,
-            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        ) else {
-            return NSAttributedString(string: text, attributes: [.font: font, .foregroundColor: NSColor.labelColor])
+    /// Cells are numbered header-first, then row by row — the order
+    /// `MarkdownRenderer.searchableStrings` emits them in.
+    private func cellFind(row: Int?, column: Int) -> TextFind? {
+        var index = column
+        if let row {
+            index += header.count + rows.prefix(row).reduce(0) { $0 + $1.count }
         }
-        let result = NSMutableAttributedString(attributedString: NSAttributedString(parsed))
-        result.addAttributes([.font: font, .foregroundColor: NSColor.labelColor],
-                             range: NSRange(location: 0, length: result.length))
-        return result
+        return cellFinds.indices.contains(index) ? cellFinds[index] : nil
     }
 }
 
 /// Reusable content marked by the model for one-click copying. Shown verbatim
 /// (no markdown parsing) — what you see is exactly what the Copy button copies.
+///
+/// Lifted neutral surface (4c): chat text sits flat on glass, code recesses,
+/// pasteables lift — light fill + hairline, clipboard glyph leading: "take
+/// this". Accent marks only the action: the Copy capsule.
 struct PasteableBlockView: View {
     let title: String?
     let content: String
+    var find: TextFind?
 
     @State private var copied = false
     @AppStorage("accentColor") private var accentHex = Theme.defaultAccentHex
+    @Environment(\.colorScheme) private var scheme
 
     private var accent: SwiftUI.Color { Theme.color(accentHex) }
 
     var body: some View {
+        let dark = scheme == .dark
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 6) {
                 Image(systemName: "doc.on.clipboard")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(accent)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 18, height: 18)
                 Text(title ?? "Pasteable")
                     .font(.system(size: 11.5, weight: .medium))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                    .truncationMode(.tail)
                 Spacer()
                 Button {
                     NSPasteboard.general.clearContents()
@@ -705,10 +877,10 @@ struct PasteableBlockView: View {
                 } label: {
                     Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
                         .font(.system(size: 10.5, weight: .medium))
-                        .foregroundStyle(accent)
+                        .foregroundStyle(copied ? .white : accent)
                         .padding(.horizontal, 8)
                         .padding(.vertical, 3)
-                        .background(accent.opacity(0.15), in: Capsule())
+                        .background(copied ? accent : accent.opacity(0.16), in: Capsule())
                         .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
@@ -716,17 +888,17 @@ struct PasteableBlockView: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
-            .background(accent.opacity(0.08))
             Divider()
-                .overlay(accent.opacity(0.25))
-            SelectableText(attributed: MarkdownRenderer.plain(content))
-                .padding(10)
+                .overlay(Theme.liftedDivider(dark: dark))
+            SelectableText(attributed: MarkdownRenderer.plain(content, size: 12.5), find: find)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
         }
-        .background(accent.opacity(0.05))
+        .background(Theme.liftedFill(dark: dark))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(accent.opacity(0.35), lineWidth: 1)
+                .strokeBorder(Theme.liftedBorder(dark: dark), lineWidth: 0.5)
         )
         .padding(.vertical, 2)
     }

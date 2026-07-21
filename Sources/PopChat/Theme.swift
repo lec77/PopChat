@@ -33,6 +33,37 @@ enum StreamingMode: String, CaseIterable, Identifiable {
     }
 }
 
+/// App-wide appearance override (Settings › General › Chat Style). Applied via
+/// NSApp.appearance so every window flips together — panel, Settings, popovers;
+/// .preferredColorScheme alone would not reach the NSPanel chrome. `auto` (nil)
+/// tracks the system live, no relaunch.
+enum AppearanceChoice: String, CaseIterable, Identifiable {
+    case auto, light, dark
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .auto: "Auto"
+        case .light: "Light"
+        case .dark: "Dark"
+        }
+    }
+
+    var nsAppearance: NSAppearance? {
+        switch self {
+        case .auto: nil
+        case .light: NSAppearance(named: .aqua)
+        case .dark: NSAppearance(named: .darkAqua)
+        }
+    }
+
+    @MainActor
+    static func applyCurrent() {
+        let raw = UserDefaults.standard.string(forKey: "appearance") ?? AppearanceChoice.auto.rawValue
+        NSApp.appearance = (AppearanceChoice(rawValue: raw) ?? .auto).nsAppearance
+    }
+}
+
 enum Theme {
     /// The four fixed accent choices — no free picker.
     static let accentOptions = ["#0A84FF", "#BF5AF2", "#FF9F0A", "#30D158"]
@@ -80,6 +111,40 @@ enum Theme {
 
     static func panelBorder(dark: Bool) -> Color {
         Color.white.opacity(dark ? 0.16 : 0.65)
+    }
+
+    // Semantic surfaces (delta 2): the transcript uses three depth levels that
+    // must keep their relationships in both modes — chat text sits flat on
+    // glass, code blocks RECESS, pasteable blocks LIFT.
+
+    /// Lifted surface — pasteable blocks: light fill + hairline, "take this".
+    static func liftedFill(dark: Bool) -> Color {
+        dark ? Color.white.opacity(0.05) : Color.black.opacity(0.04)
+    }
+
+    static func liftedBorder(dark: Bool) -> Color {
+        dark ? Color.white.opacity(0.12) : Color.black.opacity(0.10)
+    }
+
+    static func liftedDivider(dark: Bool) -> Color {
+        dark ? Color.white.opacity(0.08) : Color.black.opacity(0.08)
+    }
+
+    /// Recessed surface — code blocks.
+    static func recessedFill(dark: Bool) -> Color {
+        dark ? Color.black.opacity(0.35) : Color.black.opacity(0.05)
+    }
+
+    static func recessedHeader(dark: Bool) -> Color {
+        dark ? Color.white.opacity(0.04) : Color.black.opacity(0.03)
+    }
+
+    static func recessedBorder(dark: Bool) -> Color {
+        dark ? Color.white.opacity(0.08) : Color.black.opacity(0.07)
+    }
+
+    static func recessedCaption(dark: Bool) -> Color {
+        dark ? color("#DFDFE6").opacity(0.5) : color("#3C3C43").opacity(0.6)
     }
 }
 

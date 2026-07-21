@@ -8,23 +8,36 @@ final class PanelController: NSObject, NSWindowDelegate {
     let state = PanelState()
     private let providerStore: ProviderStore
     private let shortcutStore: ShortcutStore
-    private let chatStore: ChatStore
+    let chatStore: ChatStore // internal for the sizing smoke harness
     private var cancellables: Set<AnyCancellable> = []
     private var isHiding = false
     /// Last content height reported by the compact (no messages) layout.
     private var lastCompactHeight: CGFloat?
 
-    private static let compactMinHeight: CGFloat = 90
+    // Delta 2 (4a): 520pt min width keeps the header pills from colliding with
+    // long model names; 120pt empty-min gives the input capsule breathing room.
+    private static let minWidth: CGFloat = 520
+    private static let compactMinHeight: CGFloat = 120
     private static let expandedMinHeight: CGFloat = 320
     private static let defaultExpandedHeight: CGFloat = 440
 
-    /// User's preferred height for the expanded (has messages) state.
+    /// User's preferred height for the expanded (has messages) state. Clamped on
+    /// read: values below the minimum may persist from before minimums were
+    /// enforced (see windowWillResize).
     private var expandedHeight: CGFloat {
         get {
             let stored = UserDefaults.standard.double(forKey: "panelExpandedHeight")
-            return stored > 0 ? stored : Self.defaultExpandedHeight
+            return stored > 0 ? max(stored, Self.expandedMinHeight) : Self.defaultExpandedHeight
         }
         set { UserDefaults.standard.set(newValue, forKey: "panelExpandedHeight") }
+    }
+
+    /// The live minimum content size — 520×320 with messages, 520×120 empty (4a).
+    private var minContentSize: NSSize {
+        NSSize(
+            width: Self.minWidth,
+            height: chatStore.messages.isEmpty ? Self.compactMinHeight : Self.expandedMinHeight
+        )
     }
 
     init(providerStore: ProviderStore, shortcutStore: ShortcutStore) {
@@ -45,10 +58,10 @@ final class PanelController: NSObject, NSWindowDelegate {
 
     private lazy var panel: FloatingPanel = {
         let panel = FloatingPanel(contentRect: NSRect(x: 0, y: 0, width: 680, height: Self.defaultExpandedHeight))
-        panel.contentMinSize = NSSize(
-            width: 480,
-            height: chatStore.messages.isEmpty ? Self.compactMinHeight : Self.expandedMinHeight
-        )
+        // Minimum size is enforced in windowWillResize, NOT via contentMinSize:
+        // NSHostingView (even with sizingOptions = []) clears the window's
+        // min/max constraints to zero during layout, so contentMinSize writes
+        // are silently discarded once the content view is attached.
         panel.delegate = self
         panel.onCancel = { [weak self] in self?.hide() }
         panel.onAttachablePaste = {
@@ -71,6 +84,12 @@ final class PanelController: NSObject, NSWindowDelegate {
         // Window size is managed explicitly (setContentHeight/contentMinSize),
         // so the hosting view must not propagate SwiftUI sizes to the window.
         hostingView.sizingOptions = []
+        // The hidden titlebar of the .titled/.fullSizeContentView panel produces
+        // a ~32pt top safe-area inset. SwiftUI would lay content out below it —
+        // pushing the pills down and (in the compact state, whose height report
+        // can't see the inset) squeezing the input capsule out the bottom edge.
+        // The panel draws its own chrome; content owns the full frame.
+        hostingView.safeAreaRegions = []
         panel.contentView = hostingView
         panel.contentView?.wantsLayer = true // presentation animates this layer
         return panel
@@ -109,7 +128,7 @@ final class PanelController: NSObject, NSWindowDelegate {
     func show() {
         isHiding = false
         if chatStore.messages.isEmpty {
-            setContentHeight(lastCompactHeight ?? 110, animated: false)
+            setContentHeight(lastCompactHeight ?? Self.compactMinHeight, animated: false)
         }
         position()
         panel.alphaValue = 0
@@ -234,14 +253,11 @@ final class PanelController: NSObject, NSWindowDelegate {
     // MARK: - Dynamic height (compact ↔ expanded)
 
     private func emptinessChanged(_ empty: Bool) {
-        panel.contentMinSize = NSSize(
-            width: 480,
-            height: empty ? Self.compactMinHeight : Self.expandedMinHeight
-        )
         if !empty {
             setContentHeight(expandedHeight, animated: true)
         }
         // When emptied (new chat), ChatView reports the compact height on next layout.
+        // The minimum switches implicitly — windowWillResize reads emptiness live.
     }
 
     private func compactHeightChanged(_ height: CGFloat) {
@@ -271,6 +287,17 @@ final class PanelController: NSObject, NSWindowDelegate {
     }
 
     // MARK: - NSWindowDelegate
+
+    /// Enforces the minimum panel size for user resizes. This is the delegate
+    /// method, not contentMinSize, because the NSHostingView content view resets
+    /// the window's min/max to zero during layout regardless of sizingOptions.
+    func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
+        let minFrame = sender.frameRect(forContentRect: NSRect(origin: .zero, size: minContentSize)).size
+        return NSSize(
+            width: max(frameSize.width, minFrame.width),
+            height: max(frameSize.height, minFrame.height)
+        )
+    }
 
     func windowDidResignKey(_ notification: Notification) {
         guard !state.pinned else { return }

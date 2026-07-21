@@ -41,6 +41,8 @@ struct SettingsView: View {
     @AppStorage("streamingMode") private var streamingModeRaw = StreamingMode.perCharacter.rawValue
     @AppStorage("liquidGlass") private var liquidGlass = true
     @AppStorage("panelTint") private var panelTint = -1.0
+    @AppStorage("appearance") private var appearanceRaw = AppearanceChoice.auto.rawValue
+    @FocusState private var focusedCommandName: UUID?
     @Environment(\.colorScheme) private var scheme
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
@@ -133,6 +135,7 @@ struct SettingsView: View {
                 }
             }
             Section {
+                appearanceRow
                 accentRow
                 Picker("Your message style", selection: $bubbleStyleRaw) {
                     ForEach(BubbleStyle.allCases) { style in
@@ -156,6 +159,20 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+        }
+    }
+
+    /// Auto / Light / Dark (4f). Applied through NSApp.appearance so every
+    /// window flips together; Auto (nil) tracks the system live.
+    private var appearanceRow: some View {
+        Picker("Appearance", selection: $appearanceRaw) {
+            ForEach(AppearanceChoice.allCases) { choice in
+                Text(choice.label).tag(choice.rawValue)
+            }
+        }
+        .pickerStyle(.segmented)
+        .onChange(of: appearanceRaw) { _, _ in
+            AppearanceChoice.applyCurrent()
         }
     }
 
@@ -399,23 +416,28 @@ struct SettingsView: View {
 
     // MARK: - Commands
 
+    // Real editors (4e): prompts leave the Form's label/value pattern — a
+    // vertical-axis TextField rendered the template as a right-aligned trailing
+    // "value" that grew with content. Fixed-height TextEditors in quaternary
+    // wells scroll their own text; the Form scrolls the page.
     private var commandsTab: some View {
         Form {
             Section {
-                TextField(
-                    "System prompt sent at the start of every conversation",
-                    text: $systemPromptDraft,
-                    axis: .vertical
-                )
-                .lineLimit(4...12)
-                .font(.callout)
+                VStack(alignment: .leading, spacing: 8) {
+                    editorWell {
+                        TextEditor(text: $systemPromptDraft)
+                            .font(.system(size: 12))
+                            .scrollContentBackground(.hidden)
+                            .frame(height: 148)
+                    }
+                    Button("Reset to Default") {
+                        systemPromptDraft = ChatStore.defaultSystemPrompt
+                    }
+                    .disabled(systemPromptDraft == ChatStore.defaultSystemPrompt)
+                }
                 .onChange(of: systemPromptDraft) { _, newValue in
                     UserDefaults.standard.set(newValue, forKey: "systemPrompt")
                 }
-                Button("Reset to Default") {
-                    systemPromptDraft = ChatStore.defaultSystemPrompt
-                }
-                .disabled(systemPromptDraft == ChatStore.defaultSystemPrompt)
             } header: {
                 Text("System Prompt")
             } footer: {
@@ -426,26 +448,63 @@ struct SettingsView: View {
             }
             Section {
                 ForEach($shortcutStore.shortcuts) { $shortcut in
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack {
-                            Text("/").foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 2) {
+                            Text("/")
+                                .foregroundStyle(.secondary)
+                                .padding(.leading, 4)
                             TextField("name", text: $shortcut.name)
+                                .textFieldStyle(.plain)
+                                .font(.system(size: 13, weight: .medium))
+                                .focused($focusedCommandName, equals: shortcut.id)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 3)
+                                .background(
+                                    Color.primary.opacity(0.04),
+                                    in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                        .strokeBorder(Color.primary.opacity(0.07), lineWidth: 0.5)
+                                )
                                 .frame(width: 140)
                             Spacer()
                             Button(role: .destructive) {
                                 shortcutStore.remove(id: shortcut.id)
                             } label: {
                                 Image(systemName: "trash")
+                                    .font(.system(size: 14))
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 24, height: 24)
+                                    .contentShape(Circle())
                             }
                             .buttonStyle(.plain)
+                            .help("Delete command")
                         }
-                        TextField("Prompt template — {input} marks where your text goes", text: $shortcut.template, axis: .vertical)
-                            .lineLimit(2...4)
-                            .font(.callout)
+                        editorWell {
+                            TextEditor(text: $shortcut.template)
+                                .font(.system(size: 12))
+                                .scrollContentBackground(.hidden)
+                                .frame(height: 56)
+                                .overlay(alignment: .topLeading) {
+                                    if shortcut.template.isEmpty {
+                                        Text("Prompt template — {input} marks where your text goes")
+                                            .font(.system(size: 12))
+                                            .foregroundStyle(.tertiary)
+                                            .padding(.leading, 5)
+                                            .allowsHitTesting(false)
+                                    }
+                                }
+                        }
                     }
                     .padding(.vertical, 2)
                 }
-                Button("Add Shortcut") { shortcutStore.add() }
+                Button("Add Command…") {
+                    shortcutStore.add()
+                    // Focus lands after the new row exists in the hierarchy.
+                    let newID = shortcutStore.shortcuts.last?.id
+                    DispatchQueue.main.async { focusedCommandName = newID }
+                }
             } footer: {
                 Text("Type “/name your text” in the chat field.")
                     .font(.caption)
@@ -453,6 +512,21 @@ struct SettingsView: View {
                     .help("The compact form is shown in the transcript; the expanded template is what the model receives.")
             }
         }
+    }
+
+    /// Quaternary well the fixed-height prompt editors sit in.
+    private func editorWell<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+        content()
+            .padding(.horizontal, 7)
+            .padding(.vertical, 5)
+            .background(
+                Color.primary.opacity(0.04),
+                in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.07), lineWidth: 0.5)
+            )
     }
 
     // MARK: - Hotkey

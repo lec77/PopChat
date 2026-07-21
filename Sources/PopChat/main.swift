@@ -221,6 +221,34 @@ func installBenchmarkConversation(minLength: Int) -> URL {
     return scratch
 }
 
+/// Conversation for the ⌘F harness: long enough to scroll, with the needle in
+/// three widely separated messages so stepping matches must move the scroller.
+func installFindConversation() -> URL {
+    let scratch = FileManager.default.temporaryDirectory
+        .appendingPathComponent("popchat-find-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+    ConversationStore.overrideDirectory = scratch
+    let filler = String(repeating: "Filler prose that exists purely to make the transcript tall. ", count: 30)
+    var messages: [ChatMessage] = []
+    for index in 0..<9 {
+        let marker = index % 3 == 1 ? "needle\(index) " : "" // messages 1, 4, 7
+        // Message 4 is pages long with its needle at the very END: centering the
+        // MESSAGE would leave that hit far off screen, so it is what proves the
+        // transcript scrolls to the matched characters.
+        let body = index == 4 ? String(repeating: filler, count: 12) + " tailneedle end." : filler
+        messages.append(ChatMessage(
+            role: index % 2 == 0 ? .user : .assistant,
+            text: "\(marker)message \(index). \(body)"
+        ))
+    }
+    ConversationStore.save(Conversation(
+        id: UUID(),
+        title: "find harness",
+        updatedAt: Date(),
+        messages: messages
+    ))
+    return scratch
+}
+
 /// The transcript scroller is the vertically-scrollable NSScrollView with the
 /// tallest document — a plain "first match" walk can land on a code block's
 /// horizontal scroller or an attachment strip.
@@ -237,6 +265,104 @@ func transcriptScrollView(in root: NSView?) -> NSScrollView? {
     }
     if let root { walk(root) }
     return best
+}
+
+// Panel sizing invariants: real controller + synthetic conversation, replaying
+// empty↔non-empty transitions. With messages the content height and min must
+// never sit below the expanded minimum (320).
+if CommandLine.arguments.contains("--smoke-minsize") {
+    MainActor.assumeIsolated {
+        let scratch = installBenchmarkConversation(minLength: 2_000)
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        let providerStore = ProviderStore()
+        let shortcutStore = ShortcutStore()
+        let controller = PanelController(providerStore: providerStore, shortcutStore: shortcutStore)
+        controller.show()
+        let originalID = controller.chatStore.conversationID
+
+        // The enforced minimum lives in the windowWillResize delegate (the
+        // NSHostingView zeroes contentMinSize) — probe it like a user drag.
+        @MainActor func clamp(_ panel: NSWindow, _ size: NSSize) -> NSSize {
+            controller.windowWillResize(panel, to: size)
+        }
+
+        @MainActor func findFieldScroll(_ view: NSView?) -> NSScrollView? {
+            guard let view else { return nil }
+            if let scroll = view as? NSScrollView, scroll.documentView is NSTextView { return scroll }
+            for sub in view.subviews { if let found = findFieldScroll(sub) { return found } }
+            return nil
+        }
+
+        @MainActor func findDragStrip(_ view: NSView?) -> WindowDragView? {
+            guard let view else { return nil }
+            if let strip = view as? WindowDragView { return strip }
+            for sub in view.subviews { if let found = findDragStrip(sub) { return found } }
+            return nil
+        }
+
+        @MainActor func report(_ label: String) {
+            guard let panel = app.windows.first(where: { $0 is FloatingPanel }) else {
+                print("FAIL: no panel"); exit(1)
+            }
+            let content = panel.contentRect(forFrameRect: panel.frame)
+            let clamped = clamp(panel, NSSize(width: 400, height: 197))
+            // Where does the composer field actually sit? Its bottom edge plus the
+            // capsule + composer paddings (5+6+12) must stay inside the window.
+            var fieldNote = "field=?"
+            if let scroll = findFieldScroll(panel.contentView), let root = panel.contentView {
+                let frame = scroll.convert(scroll.bounds, to: root)
+                let bottomGap = root.isFlipped ? root.bounds.height - frame.maxY : frame.minY
+                fieldNote = "fieldY=\(Int(root.isFlipped ? frame.minY : root.bounds.height - frame.maxY))"
+                    + " fieldH=\(Int(frame.height)) gapBelowField=\(Int(bottomGap))"
+            }
+            if let strip = findDragStrip(panel.contentView), let root = panel.contentView {
+                let frame = strip.convert(strip.bounds, to: root)
+                fieldNote += " pillsY=\(Int(root.isFlipped ? frame.minY : root.bounds.height - frame.maxY))"
+                    + " pillsH=\(Int(frame.height)) rootH=\(Int(root.bounds.height))"
+            }
+            print("\(label): contentH=\(Int(content.height)) w=\(Int(content.width)) \(fieldNote) " +
+                  "dragTo400x197→\(Int(clamped.width))x\(Int(clamped.height)) " +
+                  "empty=\(controller.chatStore.messages.isEmpty)")
+        }
+
+        var step = 0
+        Timer.scheduledTimer(withTimeInterval: 0.6, repeats: true) { _ in
+            MainActor.assumeIsolated {
+                step += 1
+                switch step {
+                case 1:
+                    report("launch non-empty")
+                    controller.chatStore.newChat()
+                case 2:
+                    report("after newChat  ")
+                    controller.chatStore.loadConversation(originalID)
+                case 3:
+                    report("after reload   ")
+                default:
+                    guard let panel = app.windows.first(where: { $0 is FloatingPanel }) else { exit(1) }
+                    let height = panel.contentRect(forFrameRect: panel.frame).height
+                    let clamped = clamp(panel, NSSize(width: 400, height: 197))
+                    // The field must keep its designed bottom clearance (5+6+12
+                    // = 23pt) — a smaller gap means the input capsule is being
+                    // squeezed out of the panel (e.g. by safe-area insets the
+                    // compact height report can't see).
+                    var gapOK = false
+                    if let scroll = findFieldScroll(panel.contentView), let root = panel.contentView {
+                        let frame = scroll.convert(scroll.bounds, to: root)
+                        let bottomGap = root.isFlipped ? root.bounds.height - frame.maxY : frame.minY
+                        gapOK = bottomGap >= 20
+                    }
+                    let ok = !controller.chatStore.messages.isEmpty
+                        && height >= 319 && clamped.width >= 519 && clamped.height >= 319 && gapOK
+                    print(ok ? "PASS" : "FAIL: settled height=\(Int(height)) clamp=\(Int(clamped.width))x\(Int(clamped.height)) gapOK=\(gapOK)")
+                    try? FileManager.default.removeItem(at: scratch)
+                    exit(ok ? 0 : 1)
+                }
+            }
+        }
+        app.run()
+    }
 }
 
 // UI layout stress (no network): builds the real panel with a synthetic long
@@ -395,6 +521,246 @@ if CommandLine.arguments.contains("--smoke-typing") {
                     }
                     print("PASS")
                     exit(0)
+                }
+            }
+        }
+        app.run()
+    }
+}
+
+// ⌘Y history popover: asserts the shortcut opens it, that the filter field takes
+// focus, and that ↓/↩ select and open a chat (the popover tears down).
+if CommandLine.arguments.contains("--smoke-history") {
+    MainActor.assumeIsolated {
+        let scratch = installFindConversation()
+        for title in ["alpha chat", "beta chat"] {
+            ConversationStore.save(Conversation(
+                id: UUID(), title: title, updatedAt: Date(),
+                messages: [ChatMessage(role: .user, text: title)]
+            ))
+        }
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        let providerStore = ProviderStore()
+        let shortcutStore = ShortcutStore()
+        let controller = PanelController(providerStore: providerStore, shortcutStore: shortcutStore)
+        controller.show()
+
+        func filterField() -> NSTextField? {
+            var found: NSTextField?
+            func walk(_ view: NSView) {
+                if let field = view as? NSTextField, field.placeholderString == "Filter chats…" { found = field }
+                for sub in view.subviews where found == nil { walk(sub) }
+            }
+            // Visible windows only: a dismissed popover keeps its window (and
+            // view tree) around, so an unfiltered walk still finds the field.
+            for window in app.windows where found == nil && window.isVisible {
+                walk(window.contentView ?? NSView())
+            }
+            return found
+        }
+
+        func fail(_ message: String) -> Never {
+            print("FAIL: \(message)")
+            try? FileManager.default.removeItem(at: scratch)
+            exit(1)
+        }
+
+        var step = 0
+        Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { _ in
+            MainActor.assumeIsolated {
+                guard let panel = app.windows.first(where: { $0 is FloatingPanel }) else { return }
+                step += 1
+                switch step {
+                case 1...2:
+                    return
+                case 3:
+                    guard let event = NSEvent.keyEvent(
+                        with: .keyDown, location: .zero, modifierFlags: .command, timestamp: 0,
+                        windowNumber: panel.windowNumber, context: nil,
+                        characters: "y", charactersIgnoringModifiers: "y", isARepeat: false, keyCode: 16
+                    ) else { fail("could not synthesize ⌘Y") }
+                    if !panel.performKeyEquivalent(with: event) { fail("⌘Y was not handled by the panel") }
+                case 4...5:
+                    guard let field = filterField() else {
+                        if step == 5 { fail("history popover did not appear on ⌘Y") }
+                        return // popover animates in; give it one more tick
+                    }
+                    guard let editor = field.currentEditor(), field.window?.firstResponder === editor else {
+                        fail("history filter field did not take first responder")
+                    }
+                    editor.doCommand(by: #selector(NSResponder.moveDown(_:)))
+                    editor.doCommand(by: #selector(NSResponder.insertNewline(_:)))
+                    step = 6
+                case 6...7:
+                    if filterField() != nil {
+                        if step == 7 { fail("↩ did not open the selected chat / dismiss the popover") }
+                        return
+                    }
+                    print("PASS")
+                    try? FileManager.default.removeItem(at: scratch)
+                    exit(0)
+                default:
+                    fail("harness ran past its steps")
+                }
+            }
+        }
+        app.run()
+    }
+}
+
+// ⌘F find-in-chat: drives the real panel through open → type → step → close and
+// asserts the find field takes focus, that stepping matches moves the transcript
+// scroller, and that ⎋ tears the bar down again.
+if CommandLine.arguments.contains("--smoke-find") {
+    MainActor.assumeIsolated {
+        let scratch = installFindConversation()
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        let providerStore = ProviderStore()
+        let shortcutStore = ShortcutStore()
+        let controller = PanelController(providerStore: providerStore, shortcutStore: shortcutStore)
+        controller.show()
+
+        func findField(in root: NSView?) -> NSTextField? {
+            var found: NSTextField?
+            func walk(_ view: NSView) {
+                if let field = view as? NSTextField, field.placeholderString == "Find in chat" { found = field }
+                for sub in view.subviews where found == nil { walk(sub) }
+            }
+            if let root { walk(root) }
+            return found
+        }
+
+        func fail(_ message: String) -> Never {
+            print("FAIL: \(message)")
+            try? FileManager.default.removeItem(at: scratch)
+            exit(1)
+        }
+
+        /// Every painted highlight in the transcript, as (field, rect in field
+        /// coordinates). Laid out independently of the app's own reveal code so
+        /// the check isn't just the implementation agreeing with itself.
+        func highlights(in root: NSView?) -> [(field: NSTextField, rect: NSRect, active: Bool)] {
+            var result: [(NSTextField, NSRect, Bool)] = []
+            func walk(_ view: NSView) {
+                if let field = view as? NSTextField, field.isSelectable {
+                    let attributed = field.attributedStringValue
+                    attributed.enumerateAttribute(
+                        .backgroundColor,
+                        in: NSRange(location: 0, length: attributed.length)
+                    ) { value, range, _ in
+                        guard let color = value as? NSColor else { return }
+                        let storage = NSTextStorage(attributedString: attributed)
+                        let manager = NSLayoutManager()
+                        let container = NSTextContainer(size: NSSize(
+                            width: field.bounds.width, height: .greatestFiniteMagnitude
+                        ))
+                        container.lineFragmentPadding = 0
+                        manager.addTextContainer(container)
+                        storage.addLayoutManager(manager)
+                        manager.ensureLayout(for: container)
+                        let glyphs = manager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+                        let bounds = manager.boundingRect(forGlyphRange: glyphs, in: container)
+                        let top = field.isFlipped ? bounds.minY : field.bounds.height - bounds.maxY
+                        result.append((
+                            field,
+                            NSRect(x: bounds.minX, y: top, width: bounds.width, height: bounds.height),
+                            color.alphaComponent > 0.3
+                        ))
+                    }
+                }
+                for sub in view.subviews { walk(sub) }
+            }
+            if let root { walk(root) }
+            return result
+        }
+
+        func typeQuery(_ query: String) {
+            guard let editor = findField(in: NSApp.windows.first(where: { $0 is FloatingPanel })?.contentView)?
+                .currentEditor() else { fail("find field vanished") }
+            editor.selectAll(nil)
+            editor.insertText(query)
+        }
+
+        var step = 0
+        var offsetAtFirstMatch: CGFloat = 0
+        var measurementsBeforeTyping = 0
+        Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { _ in
+            MainActor.assumeIsolated {
+                guard let panel = app.windows.first(where: { $0 is FloatingPanel }) else { return }
+                let scroll = transcriptScrollView(in: panel.contentView)
+                step += 1
+                switch step {
+                case 1...2:
+                    return // let the panel settle
+                case 3:
+                    guard let event = NSEvent.keyEvent(
+                        with: .keyDown, location: .zero, modifierFlags: .command, timestamp: 0,
+                        windowNumber: panel.windowNumber, context: nil,
+                        characters: "f", charactersIgnoringModifiers: "f", isARepeat: false, keyCode: 3
+                    ) else { fail("could not synthesize ⌘F") }
+                    if !panel.performKeyEquivalent(with: event) { fail("⌘F was not handled by the panel") }
+                case 4:
+                    guard let field = findField(in: panel.contentView) else { fail("find bar did not appear on ⌘F") }
+                    guard let editor = field.currentEditor(), panel.firstResponder === editor else {
+                        fail("find field did not take first responder")
+                    }
+                    measurementsBeforeTyping = SelectableText.measurementCount
+                    editor.insertText("needle")
+                case 5:
+                    guard let scroll else { fail("no transcript scroll view") }
+                    // Highlights must be painted in place, and exactly one of
+                    // them is the active hit.
+                    let painted = highlights(in: panel.contentView)
+                    let active = painted.filter(\.active)
+                    print("painted highlights=\(painted.count) active=\(active.count)")
+                    // 4: messages 1, 4 and 7 carry "needleN", plus "tailneedle".
+                    if painted.count != 4 { fail("expected 4 painted matches, got \(painted.count)") }
+                    if active.count != 1 { fail("expected exactly 1 active match, got \(active.count)") }
+                    offsetAtFirstMatch = scroll.contentView.bounds.origin.y
+                    guard let editor = findField(in: panel.contentView)?.currentEditor() else {
+                        fail("find field vanished mid-search")
+                    }
+                    // doCommand routes through the field editor's delegate — the
+                    // same path a real ↓ keypress takes.
+                    editor.doCommand(by: #selector(NSResponder.moveDown(_:)))
+                case 6:
+                    guard let scroll else { fail("no transcript scroll view") }
+                    let moved = abs(scroll.contentView.bounds.origin.y - offsetAtFirstMatch)
+                    print(String(format: "match 1 at offset %.0f, ↓ moved %.0f pt", offsetAtFirstMatch, moved))
+                    if moved < 20 { fail("stepping to the next match did not scroll the transcript") }
+                    // The exactness check: this needle sits at the END of a
+                    // multi-page message.
+                    typeQuery("tailneedle")
+                case 7:
+                    guard let scroll, let document = scroll.documentView else { fail("no transcript scroll view") }
+                    let painted = highlights(in: panel.contentView)
+                    guard painted.count == 1, let hit = painted.first else {
+                        fail("expected 1 match for the tail needle, got \(painted.count)")
+                    }
+                    let inDocument = hit.field.convert(hit.rect, to: document)
+                    let visible = scroll.documentVisibleRect
+                    print(String(format: "tail hit y=%.0f (h=%.0f) visible %.0f…%.0f",
+                                 inDocument.midY, hit.field.frame.height, visible.minY, visible.maxY))
+                    if !visible.insetBy(dx: 0, dy: -1).intersects(inDocument) {
+                        fail("the matched characters are off screen — scrolled to the message, not the hit")
+                    }
+                    let typed = SelectableText.measurementCount - measurementsBeforeTyping
+                    print("transcript measurements during find typing=\(typed)")
+                    if typed > 8 { fail("highlighting re-measured the transcript (\(typed) measurements)") }
+                    guard let editor = findField(in: panel.contentView)?.currentEditor() else {
+                        fail("find field vanished before ⎋")
+                    }
+                    editor.doCommand(by: #selector(NSResponder.cancelOperation(_:)))
+                case 8:
+                    if findField(in: panel.contentView) != nil { fail("⎋ did not close the find bar") }
+                    if !panel.isVisible { fail("⎋ closed the panel instead of the find bar") }
+                    print("PASS")
+                    try? FileManager.default.removeItem(at: scratch)
+                    exit(0)
+                default:
+                    fail("harness ran past its steps")
                 }
             }
         }
