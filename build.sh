@@ -20,6 +20,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/PopChat"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
+cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"   # CFBundleIconFile
 
 # SPM dependency resource bundles (KeyboardShortcuts localizations, SwiftMath's math
 # fonts) must ship inside the app for Bundle.module lookup to succeed — without them
@@ -28,7 +29,8 @@ cp Resources/Info.plist "$APP/Contents/Info.plist"
 # plain find will not descend into it, so this silently copied nothing.
 find -L ".build/$CONFIG" -maxdepth 1 -name "*.bundle" -exec cp -R {} "$APP/Contents/Resources/" \;
 
-if [ -z "$(ls -A "$APP/Contents/Resources")" ]; then
+# Counted, not "is Resources empty" — the icon lives there too and would mask a miss.
+if [ "$(find "$APP/Contents/Resources" -maxdepth 1 -name "*.bundle" | wc -l)" -eq 0 ]; then
     echo "error: no resource bundles were copied — LaTeX rendering would crash at runtime" >&2
     exit 1
 fi
