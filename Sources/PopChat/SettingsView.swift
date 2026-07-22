@@ -172,7 +172,7 @@ struct SettingsView: View {
             } header: {
                 Text("Chat Style")
             } footer: {
-                Text("Applies to your messages in the panel. The color well beside the accent swatches sets a custom accent. Streaming text: Per-character fades in glyph by glyph, Per-sentence commits a sentence at a time. Defaults: Accent tint, Blue, Per-character streaming. Panel tint defaults to the system glass appearance; the slider overrides it for PopChat only. Reduce Transparency always wins.")
+                Text("Applies to your messages in the panel. Custom opens a picker for any accent color; Accent fill flips its text between black and white for whichever reads better. Streaming text: Per-character fades in glyph by glyph, Per-sentence commits a sentence at a time. Defaults: Accent tint, Blue, Per-character streaming. Panel tint defaults to the system glass appearance; the slider overrides it for PopChat only. Reduce Transparency always wins.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -193,10 +193,10 @@ struct SettingsView: View {
         }
     }
 
-    /// Four presets + a custom color well. Picking a color in the well both
-    /// stores it (as its own swatch, so a trip through the presets doesn't lose
-    /// it) and makes it the live accent; the extra swatch only appears once the
-    /// custom color is something the presets don't already offer.
+    /// Four presets, then the rainbow-ringed custom swatch (AccentPicker.swift)
+    /// separated by a hairline so it reads as "or make your own" rather than as
+    /// a fifth preset. The custom color lives in its own key, so selecting a
+    /// preset and coming back doesn't lose it.
     private var accentRow: some View {
         HStack(spacing: 2) {
             Text("Accent color")
@@ -204,21 +204,15 @@ struct SettingsView: View {
             ForEach(Theme.accentOptions, id: \.self) { hex in
                 accentSwatch(hex)
             }
-            if !customAccentHex.isEmpty, !Theme.accentOptions.contains(customAccentHex) {
-                accentSwatch(customAccentHex)
-            }
-            AccentColorWell(
-                hex: Binding(
-                    get: { customAccentHex.isEmpty ? accentHex : customAccentHex },
-                    set: { hex in
-                        customAccentHex = hex
-                        accentHex = hex
-                    }
-                )
-            )
-            .frame(width: 22, height: 22)
-            .padding(.leading, 6)
-            .help("Choose a custom accent color")
+            Rectangle()
+                .fill(Color.primary.opacity(0.12))
+                .frame(width: 1, height: 16)
+                .padding(.horizontal, 7)
+            CustomAccentSwatch(accentHex: $accentHex, customHex: $customAccentHex)
+            Text("Custom")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .padding(.leading, 3)
         }
     }
 
@@ -289,7 +283,7 @@ struct SettingsView: View {
             Spacer()
             Text("Looks good — ship it")
                 .font(.system(size: 13))
-                .foregroundStyle(Theme.bubbleForeground(style: style))
+                .foregroundStyle(Theme.bubbleForeground(style: style, accentHex: accentHex))
                 .padding(.vertical, 9)
                 .padding(.horizontal, 14)
                 .background(
@@ -856,47 +850,3 @@ struct SettingsView: View {
     }
 }
 
-/// The custom-accent well. SwiftUI's `ColorPicker` draws a wide bordered
-/// control that dwarfs the 18pt preset swatches; `NSColorWell` in `.minimal`
-/// style is the same picker drawn as a single swatch, so the row still reads as
-/// one strip. The binding is a hex string — the app's accent is stored that way,
-/// and comparing hexes (not NSColors, which differ by color space) is what keeps
-/// updateNSView from bouncing the well's own edit back at it.
-struct AccentColorWell: NSViewRepresentable {
-    @Binding var hex: String
-
-    /// A bare `.frame` doesn't shrink it — the well keeps its intrinsic width and
-    /// spills past the row, so the size has to come from the view itself.
-    final class CompactColorWell: NSColorWell {
-        override var intrinsicContentSize: NSSize { NSSize(width: 22, height: 22) }
-    }
-
-    func makeNSView(context: Context) -> NSColorWell {
-        let well = CompactColorWell(frame: NSRect(x: 0, y: 0, width: 22, height: 22))
-        well.colorWellStyle = .minimal
-        well.supportsAlpha = false
-        well.color = Theme.nsColor(hex)
-        well.target = context.coordinator
-        well.action = #selector(Coordinator.colorChanged(_:))
-        return well
-    }
-
-    func updateNSView(_ well: NSColorWell, context: Context) {
-        context.coordinator.hex = $hex
-        if Theme.hex(Color(nsColor: well.color)) != hex {
-            well.color = Theme.nsColor(hex)
-        }
-    }
-
-    func makeCoordinator() -> Coordinator { Coordinator(hex: $hex) }
-
-    final class Coordinator: NSObject {
-        var hex: Binding<String>
-
-        init(hex: Binding<String>) { self.hex = hex }
-
-        @objc func colorChanged(_ sender: NSColorWell) {
-            hex.wrappedValue = Theme.hex(Color(nsColor: sender.color))
-        }
-    }
-}

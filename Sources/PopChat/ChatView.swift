@@ -676,14 +676,16 @@ private struct MessageRow: View, Equatable {
                         ForEach(message.attachments) { attachment in
                             Label(attachment.filename, systemImage: "paperclip")
                                 .font(.system(size: 11))
-                                .foregroundStyle(style == .accentFill ? Color.white.opacity(0.75) : .secondary)
+                                .foregroundStyle(style == .accentFill
+                                    ? Theme.contrastingForeground(on: accentHex).opacity(0.75)
+                                    : Color.secondary)
                         }
                     }
                     if !message.text.isEmpty {
                         SelectableText(
                             attributed: MarkdownRenderer.plain(
                                 message.text,
-                                color: style == .accentFill ? .white : .labelColor
+                                color: Theme.bubbleForegroundNSColor(style: style, accentHex: accentHex)
                             ),
                             find: textFind
                         )

@@ -1252,6 +1252,103 @@ if CommandLine.arguments.contains("--smoke-find") {
     }
 }
 
+// Accent-color laws (no GUI, no network): .build/debug/PopChat --smoke-accent
+//
+// The custom accent turns any hex into HSB and back on every popover open, so
+// that round trip has to be lossless; and the reason the picker is hand-rolled
+// at all is that a color leaving 0…1 packs into #FFFFFF (the system color
+// panel's extended-range colors did exactly that — "my accent turns white").
+if CommandLine.arguments.contains("--smoke-accent") {
+    func fail(_ message: String) -> Never {
+        print("FAIL: \(message)")
+        exit(1)
+    }
+
+    // 1. HSB → hex → HSB is stable at 8-bit precision.
+    var checked = 0
+    for hueStep in 0...20 {
+        for saturation in [0.15, 0.5, 0.85, 1.0] {
+            for brightness in [0.2, 0.6, 1.0] {
+                let hue = Double(hueStep) / 20
+                let first = Theme.hex(hue: hue, saturation: saturation, brightness: brightness)
+                let (h, s, b) = Theme.hsb(first)
+                let second = Theme.hex(hue: h, saturation: s, brightness: b)
+                guard first == second else {
+                    fail("hsb round trip drifted: \(first) → \(second) (h\(hue) s\(saturation) b\(brightness))")
+                }
+                guard first.count == 7, first.hasPrefix("#"), UInt64(first.dropFirst(), radix: 16) != nil else {
+                    fail("emitted malformed hex \(first)")
+                }
+                checked += 1
+            }
+        }
+    }
+
+    // 2. Out-of-range input clamps instead of overflowing the hex. This is the
+    //    white bug in miniature: 1.4 × 255 = 357 formatted as %02X is "165",
+    //    which shifts every channel and reads back as a different color.
+    //    Hue is an angle and WRAPS (1.4 → 0.4); saturation and brightness clamp.
+    let clamped = Theme.hex(hue: 1.4, saturation: 2, brightness: 3)
+    guard clamped == Theme.hex(hue: 0.4, saturation: 1, brightness: 1) else {
+        fail("out-of-range HSB did not wrap hue / clamp saturation+brightness: \(clamped)")
+    }
+    for (hue, saturation, brightness) in [(1.4, 2.0, 3.0), (-0.3, -1.0, -2.0), (7.5, 0.5, 9.0)] {
+        let hex = Theme.hex(hue: hue, saturation: saturation, brightness: brightness)
+        guard hex.count == 7, UInt64(hex.dropFirst(), radix: 16) != nil else {
+            fail("out-of-range HSB emitted malformed hex \(hex)")
+        }
+    }
+
+    // 3. A malformed stored value falls back to the default accent, not black.
+    let fallback = Theme.components(Theme.defaultAccentHex)
+    for bad in ["", "#12", "#GGGGGG", "0A84FF00", "not a color"] {
+        let parsed = Theme.components(bad)
+        guard parsed == fallback else { fail("bad hex \(bad.isEmpty ? "<empty>" : bad) did not fall back to the default accent") }
+    }
+    guard Theme.components("#0a84ff") == Theme.components("#0A84FF") else { fail("hex parsing is case-sensitive") }
+
+    // 4. Filled bubbles pick the more legible of black/white. Pale accents are
+    //    exactly what fixed white text got wrong; mid-tone blues and purples are
+    //    what a pure max-WCAG-ratio rule gets wrong in the other direction.
+    let expectations: [(String, NSColor)] = [
+        ("#FFFFFF", .black), ("#FFD60A", .black), ("#30D158", .black),
+        ("#FF9F0A", .black), ("#9BE8F0", .black),
+        ("#000000", .white), ("#0A84FF", .white), ("#BF5AF2", .white),
+        ("#FF3B30", .white), ("#5A2AA0", .white),
+    ]
+    for (hex, expected) in expectations {
+        let picked = Theme.contrastingNSColor(on: hex)
+        guard picked == expected else {
+            fail("\(hex) picked \(picked == NSColor.white ? "white" : "black") text")
+        }
+    }
+    // The decision must be monotonic in lightness — one flip along a ramp, white
+    // below and black above. An oscillating rule would strobe while dragging the
+    // Brightness slider.
+    for hue in [0.0, 0.25, 0.6, 0.85] {
+        let decisions = (0...20).map { step -> Bool in
+            let hex = Theme.hex(hue: hue, saturation: 0.7, brightness: Double(step) / 20)
+            return Theme.contrastingNSColor(on: hex) == NSColor.black
+        }
+        // Brightness 0 is black, so every ramp starts on white text; saturated
+        // reds and blues stay there even at full brightness (they are still
+        // perceptually dark), so the flip to black is allowed, not required.
+        guard decisions.first == false else { fail("hue \(hue): a black fill must take white text") }
+        let flips = zip(decisions, decisions.dropFirst()).filter { $0 != $1 }.count
+        guard flips <= 1 else { fail("hue \(hue): text color flipped \(flips) times along a brightness ramp") }
+    }
+    guard Theme.bubbleForegroundNSColor(style: .accentTint, accentHex: "#FFD60A") == .labelColor else {
+        fail("tinted bubbles must keep label color — the fill is mostly panel")
+    }
+
+    // 5. Bubble-style migration: "quietGray" is gone, and decodes to the default.
+    guard BubbleStyle(rawValue: "quietGray") == nil else { fail("quietGray is still a case") }
+    guard BubbleStyle(rawValue: "quietGray") ?? .accentTint == .accentTint else { fail("quietGray must fall back to accentTint") }
+
+    print("OK: \(checked) HSB round trips, clamping, hex fallbacks, contrast and bubble-style migration")
+    exit(0)
+}
+
 // Design QA: renders a view to PNG in-process (`--shot <settings|switcher> <path>`),
 // so the layout can be checked without screen-recording permission.
 if let shotIndex = CommandLine.arguments.firstIndex(of: "--shot"),
@@ -1268,11 +1365,29 @@ if let shotIndex = CommandLine.arguments.firstIndex(of: "--shot"),
         }
 
         let defaults = UserDefaults.standard
-        let providerKeys = ["providersJSON", "selectedProviderID", "knownModelsJSON", "selectedModelsJSON"]
+        let providerKeys = [
+            "providersJSON", "selectedProviderID", "knownModelsJSON", "selectedModelsJSON",
+            "accentColor", "customAccentColor", "bubbleStyle",
+        ]
         let snapshot = providerKeys.reduce(into: [String: Any?]()) { $0[$1] = defaults.object(forKey: $1) }
         func restore() {
             for key in providerKeys {
                 if let value = snapshot[key] ?? nil { defaults.set(value, forKey: key) } else { defaults.removeObject(forKey: key) }
+            }
+        }
+        // A custom accent already chosen, so the row renders its selected state
+        // (`--no-custom` renders the untouched state instead).
+        if which == "general", !CommandLine.arguments.contains("--no-custom") {
+            // `--accent <hex>` overrides, for checking a fill's text color.
+            var accent = "#E0655B"
+            if let index = CommandLine.arguments.firstIndex(of: "--accent"),
+               CommandLine.arguments.count > index + 1 {
+                accent = CommandLine.arguments[index + 1]
+            }
+            defaults.set(accent, forKey: "accentColor")
+            defaults.set(accent, forKey: "customAccentColor")
+            if CommandLine.arguments.contains("--fill") {
+                defaults.set(BubbleStyle.accentFill.rawValue, forKey: "bubbleStyle")
             }
         }
 
@@ -1303,6 +1418,12 @@ if let shotIndex = CommandLine.arguments.firstIndex(of: "--shot"),
                 store: store, shortcutStore: ShortcutStore(), tab: .general
             ))
             size = NSSize(width: 540, height: 620)
+        case "accent":
+            content = NSHostingView(rootView: AccentPickerPopover(
+                accentHex: .constant("#E0655B"), customHex: .constant("#E0655B")
+            )
+                .background(Color(nsColor: .windowBackgroundColor)))
+            size = NSSize(width: 268, height: 190)
         default:
             content = NSHostingView(rootView: SettingsView(
                 store: store, shortcutStore: ShortcutStore(), tab: .providers, editing: groq.id
