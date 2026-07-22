@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-/// The header pill's provider + model switcher (delta 5, 7c) — replaces the stock
+/// The header pill's provider + model + effort switcher (delta 5, 7c) — replaces the stock
 /// `Menu`, which forced provider and model to be chosen in two separate,
 /// order-dependent steps.
 ///
@@ -25,14 +25,35 @@ struct ProviderSwitcher: View {
     @State private var previewID = UUID()
     @State private var column = Column.providers
     @State private var modelIndex = 0
+    @State private var effortIndex = 0
     @State private var hoveredRow: String?
     @State private var appeared = false
     @State private var isClosing = false
 
-    private enum Column { case providers, models }
+    init(store: ProviderStore) {
+        self.store = store
+        let providerID = store.selectedID
+        let availableModels = Array((store.knownModels[providerID] ?? []).prefix(Metrics.renderCap))
+        let rememberedModel = store.rememberedModel(providerID)
+        let initialModelIndex = availableModels.firstIndex(of: rememberedModel) ?? 0
+        let initialModel = availableModels.indices.contains(initialModelIndex)
+            ? availableModels[initialModelIndex]
+            : rememberedModel
+        let availableEfforts = store.supportedEfforts(providerID, model: initialModel)
+        let rememberedEffort = store.rememberedEffort(providerID, model: initialModel)
+
+        _previewID = State(initialValue: providerID)
+        _modelIndex = State(initialValue: initialModelIndex)
+        _effortIndex = State(initialValue: rememberedEffort.flatMap {
+            availableEfforts.firstIndex(of: $0)
+        } ?? 0)
+    }
+
+    private enum Column { case providers, models, efforts }
 
     private enum Metrics {
         static let width: CGFloat = 372
+        static let effortWidth: CGFloat = 118
         static let railWidth: CGFloat = 150
         static let row: CGFloat = 25
         static let header: CGFloat = 21
@@ -48,6 +69,19 @@ struct ProviderSwitcher: View {
     private var models: [String] {
         Array((store.knownModels[previewID] ?? []).prefix(Metrics.renderCap))
     }
+    private var previewModel: String {
+        models.indices.contains(modelIndex) ? models[modelIndex] : store.rememberedModel(previewID)
+    }
+    private var efforts: [String] {
+        store.supportedEfforts(previewID, model: previewModel)
+    }
+    /// Reserve the third lane whenever any provider in this popover can use it,
+    /// keeping the shell width stable while the user previews providers/models.
+    private var switcherWidth: CGFloat {
+        rail.contains(where: { store.hasEffortModels($0.id) })
+            ? Metrics.width + Metrics.effortWidth
+            : Metrics.width
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -55,26 +89,45 @@ struct ProviderSwitcher: View {
                 providerRail
                 Divider()
                 modelColumn
+                if !efforts.isEmpty {
+                    Divider()
+                    effortColumn
+                }
             }
             .frame(height: bodyHeight)
             Divider()
             footer
         }
-        .frame(width: Metrics.width)
+        .frame(width: switcherWidth)
         .background { keyCapture }
         // Pops from the pill's left edge (5b's curve, 7c's timing).
         .scaleEffect(appeared || reduceMotion ? 1 : 0.96, anchor: .topLeading)
         .opacity(appeared ? 1 : 0)
         .animation(shellAnimation, value: appeared)
         .onAppear {
+            // Re-assert the live provider every presentation. `init`'s
+            // State(initialValue:) seeds only the FIRST construction of this view
+            // identity — it's there so bodyHeight/switcherWidth are final before
+            // the popover presents (5c) — so a re-presented popover that kept its
+            // state would otherwise open on whatever was last previewed, and ↩
+            // would commit a provider the user never browsed to in this session.
             previewID = store.selectedID
             syncModelIndex()
+            syncEffortIndex()
             store.lazyFetchModels(for: store.selectedID)
             appeared = true
         }
         .onChange(of: previewID) { _, id in
             store.lazyFetchModels(for: id)
             syncModelIndex()
+            syncEffortIndex()
+        }
+        .onChange(of: models) { _, _ in
+            syncModelIndex()
+            syncEffortIndex()
+        }
+        .onChange(of: modelIndex) { _, _ in
+            syncEffortIndex()
         }
     }
 
@@ -226,6 +279,12 @@ struct ProviderSwitcher: View {
         .buttonStyle(.plain)
         .onHover { inside in
             hoveredRow = inside ? "m:\(model)" : (hoveredRow == "m:\(model)" ? nil : hoveredRow)
+            // Cascading-menu behaviour: moving across a model previews its
+            // supported effort choices without committing either value.
+            if inside {
+                modelIndex = index
+                column = .models
+            }
         }
     }
 
@@ -233,6 +292,82 @@ struct ProviderSwitcher: View {
         let name = previewProvider?.name ?? "Models"
         let count = store.knownModels[previewID]?.count ?? 0
         return count > 0 ? "\(name) · \(count) models" : name
+    }
+
+    // MARK: - Reasoning effort
+
+    private var effortColumn: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            columnHeader("Effort")
+            ScrollView {
+                VStack(alignment: .leading, spacing: 1) {
+                    ForEach(Array(efforts.enumerated()), id: \.element) { index, effort in
+                        effortRow(effort, index: index)
+                    }
+                }
+            }
+            .scrollBounceBehavior(.basedOnSize)
+            Text("For \(previewModel)")
+                .font(.system(size: 9.5))
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .padding(.horizontal, 8)
+                .frame(height: Metrics.row, alignment: .leading)
+        }
+        .padding(Metrics.inset)
+        .frame(width: Metrics.effortWidth, alignment: .leading)
+    }
+
+    private func effortRow(_ effort: String, index: Int) -> some View {
+        let isCurrent = effort == store.rememberedEffort(previewID, model: previewModel)
+        let isFocused = column == .efforts && index == effortIndex
+        return Button {
+            commitEffort(effort)
+        } label: {
+            HStack(spacing: 6) {
+                Text(effortLabel(effort))
+                    .font(.system(size: 12, weight: isCurrent ? .medium : .regular))
+                    .lineLimit(1)
+                Spacer(minLength: 2)
+                if isCurrent {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(accent)
+                }
+            }
+            .foregroundStyle(isCurrent ? Color.primary : Color.primary.opacity(0.8))
+            .padding(.horizontal, 8)
+            .frame(height: Metrics.row, alignment: .leading)
+            .background(
+                isCurrent ? Color.primary.opacity(0.08)
+                    : isFocused || hoveredRow == "e:\(effort)" ? Color.primary.opacity(0.06)
+                    : .clear,
+                in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+            )
+            .overlay {
+                if isFocused {
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .strokeBorder(accent.opacity(0.7), lineWidth: 1)
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { inside in
+            hoveredRow = inside ? "e:\(effort)" : (hoveredRow == "e:\(effort)" ? nil : hoveredRow)
+            if inside {
+                effortIndex = index
+                column = .efforts
+            }
+        }
+    }
+
+    private func effortLabel(_ effort: String) -> String {
+        switch effort {
+        case "xhigh": "Extra High"
+        default: effort.capitalized
+        }
     }
 
     // MARK: - Chrome
@@ -304,7 +439,9 @@ struct ProviderSwitcher: View {
         let railContent = Metrics.header + CGFloat(rail.count + 1) * (Metrics.row + 1)
         let modelRows = max(models.count, 1) + 1 // + the refresh row
         let modelContent = Metrics.header + CGFloat(modelRows) * (Metrics.row + 1)
-        let tallest = max(railContent, modelContent) + Metrics.inset * 2
+        let effortRows = efforts.isEmpty ? 0 : efforts.count + 1 // + model hint
+        let effortContent = Metrics.header + CGFloat(effortRows) * (Metrics.row + 1)
+        let tallest = max(max(railContent, modelContent), effortContent) + Metrics.inset * 2
         return min(max(tallest, 120), Metrics.maxBody)
     }
 
@@ -315,13 +452,23 @@ struct ProviderSwitcher: View {
 
     // MARK: - Commit & close
 
+    /// Passes only an EXPLICIT prior choice. `rememberedEffort` would hand back the
+    /// model's advertised default, and `select` writes whatever it is given into
+    /// `selectedModelEfforts` — so committing a model would silently freeze today's
+    /// default in as the user's pick and ignore the provider's future one.
     private func commitModel(_ model: String) {
-        store.select(previewID, model: model)
+        store.select(previewID, model: model, effort: store.chosenEffort(previewID, model: model))
+        close()
+    }
+
+    private func commitEffort(_ effort: String) {
+        store.select(previewID, model: previewModel, effort: effort)
         close()
     }
 
     private func commitProvider(_ id: UUID) {
-        store.select(id, model: store.rememberedModel(id))
+        let model = store.rememberedModel(id)
+        store.select(id, model: model, effort: store.chosenEffort(id, model: model))
         close()
     }
 
@@ -347,14 +494,24 @@ struct ProviderSwitcher: View {
                 switch key {
                 case .up: move(-1)
                 case .down: move(1)
-                case .left: column = .providers
+                case .left:
+                    switch column {
+                    case .providers: break
+                    case .models: column = .providers
+                    case .efforts: column = .models
+                    }
                 case .right:
-                    if !models.isEmpty {
+                    if column == .providers, !models.isEmpty {
                         column = .models
                         syncModelIndex()
+                    } else if column == .models, !efforts.isEmpty {
+                        column = .efforts
+                        syncEffortIndex()
                     }
                 case .return:
-                    if column == .models, models.indices.contains(modelIndex) {
+                    if column == .efforts, efforts.indices.contains(effortIndex) {
+                        commitEffort(efforts[effortIndex])
+                    } else if column == .models, models.indices.contains(modelIndex) {
                         commitModel(models[modelIndex])
                     } else {
                         commitProvider(previewID)
@@ -378,6 +535,9 @@ struct ProviderSwitcher: View {
         case .models:
             guard !models.isEmpty else { return }
             modelIndex = min(max(modelIndex + delta, 0), models.count - 1)
+        case .efforts:
+            guard !efforts.isEmpty else { return }
+            effortIndex = min(max(effortIndex + delta, 0), efforts.count - 1)
         }
     }
 
@@ -386,6 +546,12 @@ struct ProviderSwitcher: View {
     private func syncModelIndex() {
         let remembered = store.rememberedModel(previewID)
         modelIndex = models.firstIndex(of: remembered) ?? 0
+    }
+
+    private func syncEffortIndex() {
+        let remembered = store.rememberedEffort(previewID, model: previewModel)
+        effortIndex = remembered.flatMap { efforts.firstIndex(of: $0) } ?? 0
+        if efforts.isEmpty, column == .efforts { column = .models }
     }
 }
 

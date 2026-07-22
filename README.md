@@ -17,9 +17,11 @@ Native Swift + SwiftUI, no Electron. Menu-bar only, no Dock icon.
   last dragged it. ⌘P pins it open.
 - **Any OpenAI-compatible provider** — OpenAI, OpenRouter, Ollama, or any custom endpoint
   (DeepSeek, Groq, LM Studio, …), plus model discovery via `/models`. Switch provider and
-  model from a pill in the panel header.
-- **Sign in with ChatGPT** — use your own ChatGPT Plus/Pro subscription instead of an API
-  key, via the same OAuth flow the Codex CLI uses.
+  model from a pill in the panel header. Models with explicit reasoning capabilities get
+  a third **Effort** column, remembered independently per provider/model.
+- **ChatGPT subscription (two paths)** — use a locally installed, signed-in Codex through
+  `codex app-server` (preferred), or keep using PopChat's existing direct OAuth/backend
+  adapter (unofficial and explicitly marked as potentially risky in Settings).
 - **Streaming with a typewriter feel**, a stop button, and errors surfaced in the
   transcript rather than swallowed.
 - **Web search & fetch** — the model can call `web_search` and `fetch_url` in a capped
@@ -77,8 +79,14 @@ There is no Xcode project — it's plain SwiftPM (`Package.swift`) plus `build.s
 Open Settings from the menu bar icon or **⌘,** inside the panel.
 
 - **Providers** — pick a preset or add a custom OpenAI-compatible endpoint, paste an API
-  key, and fetch the model list. For ChatGPT-subscription access, use *Sign in with
-  ChatGPT* (opens your browser; needs port 1455 free during the flow).
+  key, and fetch the model list. ChatGPT-subscription access has two separate presets:
+    - *OpenAI (Codex app-server)*: preferred. You must install and update Codex yourself,
+      run `codex login` in Terminal, and ensure PopChat can find the `codex` executable
+      (an explicit path field is available). PopChat only starts the local app-server; it
+      does not install Codex or own/copy its login.
+    - *OpenAI subscription (unofficial)*: the existing direct OAuth flow. It opens your
+      browser and needs port 1455 during sign-in. Because it calls a backend not documented
+      for third-party apps, it may break and may carry account or terms risk.
 - **Web Search** — choose the engine; Tavily/Brave need keys, DuckDuckGo doesn't.
 - **Commands** — edit the system prompt and define slash commands.
 - **Hotkey** — record whatever global shortcut you want (⌥Space by default).
@@ -128,10 +136,26 @@ POPCHAT_API_KEY=… .build/debug/PopChat --smoke-search       # tool-calling loo
 
 `--smoke-persist`, `--smoke-history`, `--smoke-minsize`, `--smoke-pasteable`,
 `--smoke-providers`, `--smoke-accent`, `--smoke-typewriter`, `--chatgpt-login` and
-`--smoke-chatgpt` cover the rest. The performance harnesses fail the build on
-main-thread stalls, so run them after touching the transcript, the composer, or panel
-sizing. Each GUI harness builds a real key window, so run them one at a time rather than
-back-to-back.
+`--smoke-chatgpt` cover the rest. `--check-codex-app-server` checks the installed Codex,
+ChatGPT login, and available model catalog without starting a model turn;
+`--smoke-codex-refresh-coalescing` verifies overlapping checks use one process. Three
+harnesses drive a fake app-server instead of the real one, so they cost no subscription
+quota and need no Codex install — the fixtures live in `Tools/`:
+
+```sh
+.build/debug/PopChat --smoke-codex-app-server-streaming    Tools/fake-codex-stream
+.build/debug/PopChat --smoke-codex-app-server-timeout      Tools/fake-codex-stall
+.build/debug/PopChat --smoke-codex-app-server-backpressure Tools/fake-codex-wedge
+```
+
+They guard, in order: JSONL notification ordering plus multi-item turns (both agent
+messages must survive, and the first delta must not wait on the `turn/start` response);
+recovery from a process that goes silent mid-turn; and the rule that a process which
+stops draining its stdin cannot wedge PopChat — never hold a lock across the blocking
+write, or Stop and the watchdog both block behind it. The performance
+harnesses fail the build on main-thread stalls, so run them after touching the transcript,
+the composer, or panel sizing. Each GUI harness builds a real key window, so run them one
+at a time rather than back-to-back.
 
 ## License
 
@@ -139,8 +163,11 @@ MIT — see [LICENSE](LICENSE).
 
 ## Status
 
-Version 0.1.0 — built for personal use and shared as-is. Out of scope by design: code
-execution, arbitrary tool plugins, voice, multi-window.
+Version 0.1.0 — built for personal use and shared as-is. Out of scope by design:
+model-controlled code execution, arbitrary tool plugins, voice, multi-window.
 
-The ChatGPT-subscription path uses an unofficial-but-tolerated backend (your own
-subscription, your own machine); expect it to occasionally need updating.
+The direct ChatGPT-subscription path is unofficial and potentially risky; it is retained
+for existing users but may break or conflict with account/usage terms. The preferred
+alternative delegates to the user's own Codex installation through the experimental
+`codex app-server` protocol. That path requires the user to install, authenticate, and
+maintain Codex, and may need compatibility updates as the protocol evolves.

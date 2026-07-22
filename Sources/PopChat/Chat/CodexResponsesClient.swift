@@ -86,6 +86,7 @@ enum CodexResponsesClient {
                 outcome = try await streamOneRound(
                     input: input,
                     model: config.model,
+                    reasoningEffort: config.reasoningEffort,
                     instructions: instructions,
                     sessionID: sessionID,
                     toolsEnabled: executor != nil,
@@ -192,6 +193,7 @@ enum CodexResponsesClient {
     private static func streamOneRound(
         input: [[String: Any]],
         model: String,
+        reasoningEffort: String?,
         instructions: String,
         sessionID: String,
         toolsEnabled: Bool,
@@ -208,7 +210,7 @@ enum CodexResponsesClient {
             // With store:false, reasoning items must round-trip through the tool
             // loop with their encrypted payloads, or the next request is rejected.
             "include": ["reasoning.encrypted_content"],
-            "reasoning": ["effort": "medium", "summary": "auto"],
+            "reasoning": ["effort": reasoningEffort ?? "medium", "summary": "auto"],
             "prompt_cache_key": sessionID,
         ]
         if toolsEnabled {

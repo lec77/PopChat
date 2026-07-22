@@ -249,6 +249,158 @@ if CommandLine.arguments.contains("--smoke-typewriter") {
     exit(failures.isEmpty ? 0 : 1)
 }
 
+// User-installed Codex app-server check (no UI, no model turn/quota use):
+//   .build/debug/PopChat --check-codex-app-server
+if CommandLine.arguments.contains("--check-codex-app-server") {
+    Task {
+        do {
+            let inspection = try await CodexAppServerClient.inspect(includeModels: true)
+            print("codex=ready account=\(inspection.email ?? "?") plan=\(inspection.plan ?? "?")")
+            print("models=\(inspection.models.joined(separator: ",")) default=\(inspection.defaultModel ?? "?")")
+            let effortModels = inspection.models.compactMap { model -> String? in
+                guard let efforts = inspection.supportedEfforts[model], !efforts.isEmpty else { return nil }
+                return "\(model):\(efforts.joined(separator: "/"))"
+            }
+            print("efforts=\(effortModels.joined(separator: ","))")
+            exit(0)
+        } catch {
+            print("CODEX-APP-SERVER-ERROR: \(error.localizedDescription)")
+            exit(1)
+        }
+    }
+    RunLoop.main.run()
+}
+
+// Deterministic transport regression harness. Pass a fake app-server executable
+// that sends a delta before acknowledging turn/start; the first partial must not
+// wait for that acknowledgement:
+//   .build/debug/PopChat --smoke-codex-app-server-streaming /path/to/fake-codex
+if let flag = CommandLine.arguments.firstIndex(of: "--smoke-codex-app-server-streaming"),
+   CommandLine.arguments.count > flag + 1 {
+    let executable = URL(fileURLWithPath: CommandLine.arguments[flag + 1])
+    Task {
+        let started = Date()
+        var firstPartialDelay: TimeInterval?
+        var final = ""
+        var failure: String?
+        let config = ProviderConfig(
+            baseURL: "", apiKey: "", model: "fake-model",
+            kind: .codexAppServer
+        )
+        let history = [OpenAIChatClient.WireMessage(role: "user", content: .text("stream"))]
+        for await event in CodexAppServerClient.run(
+            history: history,
+            config: config,
+            executableOverride: executable
+        ) {
+            switch event {
+            case .partial(let text):
+                if firstPartialDelay == nil { firstPartialDelay = Date().timeIntervalSince(started) }
+                final = text
+            case .done(let text):
+                final = text
+            case .activity:
+                break
+            case .error(let message):
+                failure = message
+            }
+        }
+        let delay = firstPartialDelay ?? .infinity
+        let lead = Date().timeIntervalSince(started) - delay
+        // The fake server completes two separate agentMessage items. Both must
+        // survive into the final snapshot as well as the first delta arriving
+        // before the delayed turn/start acknowledgement.
+        let passed = failure == nil && final == "A\n\nB" && lead > 1.0
+        print(String(
+            format: "first-partial=%.3fs lead=%.3fs final=%@ %@",
+            delay, lead, final.replacingOccurrences(of: "\n", with: "\\n"),
+            passed ? "PASS" : "FAIL"
+        ))
+        if let failure { print("ERROR: \(failure)") }
+        exit(passed ? 0 : 1)
+    }
+    RunLoop.main.run()
+}
+
+// A fake executable for this harness acknowledges setup, then stays silent after
+// turn/start. The adapter must terminate it and surface the inactivity error:
+//   .build/debug/PopChat --smoke-codex-app-server-timeout /path/to/fake-codex
+if let flag = CommandLine.arguments.firstIndex(of: "--smoke-codex-app-server-timeout"),
+   CommandLine.arguments.count > flag + 1 {
+    let executable = URL(fileURLWithPath: CommandLine.arguments[flag + 1])
+    Task {
+        let started = Date()
+        var failure: String?
+        let config = ProviderConfig(
+            baseURL: "", apiKey: "", model: "fake-model",
+            kind: .codexAppServer
+        )
+        let history = [OpenAIChatClient.WireMessage(role: "user", content: .text("stall"))]
+        for await event in CodexAppServerClient.run(
+            history: history,
+            config: config,
+            executableOverride: executable,
+            inactivityTimeout: 0.25
+        ) {
+            if case .error(let message) = event { failure = message }
+        }
+        let elapsed = Date().timeIntervalSince(started)
+        let passed = failure?.contains("stopped responding") == true && elapsed < 2
+        print(String(format: "timeout=%.3fs %@ %@", elapsed, failure ?? "no error", passed ? "PASS" : "FAIL"))
+        exit(passed ? 0 : 1)
+    }
+    RunLoop.main.run()
+}
+
+// Back-pressure regression. A fake executable that ACKNOWLEDGES setup and then
+// stops draining its stdin must not be able to wedge PopChat: the adapter blocks
+// inside a large `thread/inject_items` write, and stop() — the watchdog's and the
+// Stop button's only exit — must still be able to terminate the child. Holding a
+// lock across that write made stop() block on the lock the blocked write owned,
+// and this harness never returned:
+//   .build/debug/PopChat --smoke-codex-app-server-backpressure /path/to/fake-codex
+if let flag = CommandLine.arguments.firstIndex(of: "--smoke-codex-app-server-backpressure"),
+   CommandLine.arguments.count > flag + 1 {
+    let executable = URL(fileURLWithPath: CommandLine.arguments[flag + 1])
+    Task {
+        let started = Date()
+        var failure: String?
+        let config = ProviderConfig(
+            baseURL: "", apiKey: "", model: "fake-model",
+            kind: .codexAppServer
+        )
+        // Well past a ~64 KB pipe buffer: one downscaled image attachment is
+        // about this big, so any real conversation carrying one reaches here.
+        let filler = String(repeating: "x", count: 20_000)
+        var history: [OpenAIChatClient.WireMessage] = (0..<40).map { index in
+            OpenAIChatClient.WireMessage(
+                role: index.isMultiple(of: 2) ? "user" : "assistant",
+                content: .text(filler)
+            )
+        }
+        history.append(OpenAIChatClient.WireMessage(role: "user", content: .text("go")))
+        for await event in CodexAppServerClient.run(
+            history: history,
+            config: config,
+            executableOverride: executable,
+            inactivityTimeout: 0.5
+        ) {
+            if case .error(let message) = event { failure = message }
+        }
+        // The assertion is that the stream ENDS AT ALL, with the inactivity error
+        // rather than a hang — and that the EPIPE from terminating the child mid
+        // write is thrown, not delivered as a fatal SIGPIPE.
+        let elapsed = Date().timeIntervalSince(started)
+        let passed = failure?.contains("stopped responding") == true && elapsed < 10
+        print(String(
+            format: "backpressure=%.3fs %@ %@",
+            elapsed, failure ?? "no error", passed ? "PASS" : "FAIL"
+        ))
+        exit(passed ? 0 : 1)
+    }
+    RunLoop.main.run()
+}
+
 // ChatGPT-subscription auth + streaming checks (no UI):
 //   .build/debug/PopChat --chatgpt-login    interactive: opens the browser OAuth flow
 //   .build/debug/PopChat --smoke-chatgpt    requires a prior login; one streaming turn
@@ -1367,6 +1519,7 @@ if let shotIndex = CommandLine.arguments.firstIndex(of: "--shot"),
         let defaults = UserDefaults.standard
         let providerKeys = [
             "providersJSON", "selectedProviderID", "knownModelsJSON", "selectedModelsJSON",
+            "knownModelEffortsJSON", "defaultModelEffortsJSON", "selectedModelEffortsJSON",
             "accentColor", "customAccentColor", "bubbleStyle",
         ]
         let snapshot = providerKeys.reduce(into: [String: Any?]()) { $0[$1] = defaults.object(forKey: $1) }
@@ -1399,20 +1552,31 @@ if let shotIndex = CommandLine.arguments.firstIndex(of: "--shot"),
         let groq = Provider(id: UUID(), name: "Groq", baseURL: "https://api.groq.com/openai/v1", isPreset: false, defaultModel: "llama-3.3-70b")
         store.providers = [chatgpt, deepseek, groq, router, ollama]
         store.knownModels = [
+            chatgpt.id: ChatGPTAuth.modelCatalog,
             deepseek.id: ["deepseek-chat", "deepseek-coder", "deepseek-reasoner"],
             groq.id: ["llama-3.3-70b", "mixtral-8x7b"],
         ]
-        store.selectedModels = [deepseek.id: "deepseek-chat", groq.id: "llama-3.3-70b"]
-        store.selectedID = deepseek.id
+        store.knownModelEfforts = [chatgpt.id: Dictionary(uniqueKeysWithValues: ChatGPTAuth.modelCatalog.map {
+            ($0, ChatGPTAuth.supportedReasoningEfforts(for: $0))
+        })]
+        store.defaultModelEfforts = [chatgpt.id: Dictionary(uniqueKeysWithValues: ChatGPTAuth.modelCatalog.compactMap { model in
+            ChatGPTAuth.defaultReasoningEffort(for: model).map { (model, $0) }
+        })]
+        store.selectedModels = [
+            chatgpt.id: ChatGPTAuth.defaultModel,
+            deepseek.id: "deepseek-chat",
+            groq.id: "llama-3.3-70b",
+        ]
+        store.selectedID = which == "switcher-effort" ? chatgpt.id : deepseek.id
 
         let content: NSView
         let size: NSSize
         switch which {
-        case "switcher":
+        case "switcher", "switcher-effort":
             content = NSHostingView(rootView: ProviderSwitcher(store: store)
                 .padding(20)
                 .background(Color(nsColor: .windowBackgroundColor)))
-            size = NSSize(width: 412, height: 340)
+            size = NSSize(width: which == "switcher-effort" ? 530 : 412, height: 340)
         case "general":
             content = NSHostingView(rootView: SettingsView(
                 store: store, shortcutStore: ShortcutStore(), tab: .general
@@ -1463,20 +1627,90 @@ if let shotIndex = CommandLine.arguments.firstIndex(of: "--shot"),
 
 // Delta 5's core rule, which is a BEHAVIOUR and not a look: browsing providers
 // must never switch what the next message uses. Drives the real 7c switcher
-// through ↓ / → / ↓ / ↩ and asserts nothing commits until ↩, then asserts the
+// through provider → model → effort and asserts nothing commits until ↩, then asserts the
 // catalog side (addCustom must not select) and that the green-dot predicate and
 // the rail agree.
 //
-// Runs against the real ProviderStore — the four provider defaults keys are
+// Runs against the real ProviderStore — the provider defaults keys are
 // snapshotted and restored on every exit path, and only `.test` base URLs are
 // ever installed, so no network and no lasting change to the user's setup.
+private actor CodexRefreshProbe {
+    private(set) var calls = 0
+
+    func inspect(includeModels: Bool) async throws -> CodexAppServerClient.Inspection {
+        calls += 1
+        try await Task.sleep(for: .milliseconds(150))
+        return CodexAppServerClient.Inspection(
+            email: "fake@example.test",
+            plan: "test",
+            models: includeModels ? ["fake-model"] : [],
+            defaultModel: includeModels ? "fake-model" : nil,
+            supportedEfforts: includeModels ? ["fake-model": ["low", "high"]] : [:],
+            defaultEfforts: includeModels ? ["fake-model": "low"] : [:]
+        )
+    }
+}
+
+// Three simultaneous callers must share one inspection and publish one coherent
+// result. This is intentionally independent of a real Codex installation.
+if CommandLine.arguments.contains("--smoke-codex-refresh-coalescing") {
+    Task { @MainActor in
+        let defaults = UserDefaults.standard
+        let keys = [
+            "providersJSON", "selectedProviderID", "knownModelsJSON", "selectedModelsJSON",
+            "knownModelEffortsJSON", "defaultModelEffortsJSON", "selectedModelEffortsJSON",
+        ]
+        let snapshot = keys.reduce(into: [String: Any?]()) { $0[$1] = defaults.object(forKey: $1) }
+        func restore() {
+            for key in keys {
+                if let value = snapshot[key] ?? nil { defaults.set(value, forKey: key) }
+                else { defaults.removeObject(forKey: key) }
+            }
+        }
+
+        let store = ProviderStore()
+        let provider = ProviderStore.codexAppServerPreset()
+        store.providers = [provider]
+        store.selectedID = provider.id
+        let probe = CodexRefreshProbe()
+        async let first: Void = store.refreshCodexAppServer(
+            includeModels: true,
+            inspection: { try await probe.inspect(includeModels: $0) }
+        )
+        async let second: Void = store.refreshCodexAppServer(
+            includeModels: true,
+            inspection: { try await probe.inspect(includeModels: $0) }
+        )
+        async let third: Void = store.refreshCodexAppServer(
+            includeModels: true,
+            inspection: { try await probe.inspect(includeModels: $0) }
+        )
+        _ = await (first, second, third)
+
+        let calls = await probe.calls
+        let ready: Bool
+        if case .ready = store.codexAppServerStatus { ready = true } else { ready = false }
+        let passed = calls == 1
+            && ready
+            && store.knownModels[provider.id] == ["fake-model"]
+            && !store.fetchingProviders.contains(provider.id)
+        print("refresh-calls=\(calls) ready=\(ready) \(passed ? "PASS" : "FAIL")")
+        restore()
+        exit(passed ? 0 : 1)
+    }
+    RunLoop.main.run()
+}
+
 if CommandLine.arguments.contains("--smoke-providers") {
     MainActor.assumeIsolated {
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
 
         let defaults = UserDefaults.standard
-        let providerKeys = ["providersJSON", "selectedProviderID", "knownModelsJSON", "selectedModelsJSON"]
+        let providerKeys = [
+            "providersJSON", "selectedProviderID", "knownModelsJSON", "selectedModelsJSON",
+            "knownModelEffortsJSON", "defaultModelEffortsJSON", "selectedModelEffortsJSON",
+        ]
         let snapshot = providerKeys.reduce(into: [String: Any?]()) { $0[$1] = defaults.object(forKey: $1) }
         func restore() {
             for key in providerKeys {
@@ -1499,13 +1733,21 @@ if CommandLine.arguments.contains("--smoke-providers") {
         store.providers = [alpha, beta]
         store.knownModels = [alpha.id: ["a-1", "a-2"], beta.id: ["b-1", "b-2"]]
         store.selectedModels = [alpha.id: "a-1", beta.id: "b-1"]
+        store.knownModelEfforts = [
+            beta.id: ["b-1": ["low", "medium", "high"], "b-2": ["low", "medium", "high"]],
+        ]
+        store.defaultModelEfforts = [beta.id: ["b-1": "medium", "b-2": "medium"]]
+        store.selectedModelEfforts = [:]
         store.selectedID = alpha.id
         guard store.configuredProviders.map(\.id) == [alpha.id, beta.id] else {
             fail("seeded providers are not both offered by the switcher")
         }
+        guard store.currentReasoningEffort == nil else {
+            fail("provider without effort capabilities acquired an effort value")
+        }
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 372, height: 400),
+            contentRect: NSRect(x: 0, y: 0, width: 490, height: 400),
             styleMask: [.titled, .closable], backing: .buffered, defer: false
         )
         window.contentView = NSHostingView(rootView: ProviderSwitcher(store: store))
@@ -1563,11 +1805,23 @@ if CommandLine.arguments.contains("--smoke-providers") {
                         fail("previewing another provider's models changed the live model")
                     }
                 case 4:
-                    send(36, "↩")
+                    send(124, "→")             // into the effort column (default medium)
+                    send(125, "↓")             // medium → high
+                    if store.selectedID != alpha.id || store.selectedModelEfforts[beta.id] != nil {
+                        fail("previewing effort committed before ↩")
+                    }
                 case 5:
+                    send(36, "↩")
+                case 6:
                     if store.selectedID != beta.id { fail("↩ did not commit the previewed provider") }
                     if store.selectedModels[beta.id] != "b-2" { fail("↩ did not commit the focused model") }
-                    print("preview stayed inert; ↩ committed Harness B · b-2")
+                    if store.selectedModelEfforts[beta.id]?["b-2"] != "high" {
+                        fail("↩ did not commit the focused effort")
+                    }
+                    if store.currentConfig()?.reasoningEffort != "high" {
+                        fail("committed effort did not reach ProviderConfig")
+                    }
+                    print("preview stayed inert; ↩ committed Harness B · b-2 · high")
 
                     // Catalog side (7b): adding a provider in Settings must not
                     // redirect the live conversation.

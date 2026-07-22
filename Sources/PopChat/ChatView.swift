@@ -170,9 +170,9 @@ struct ChatView: View {
         .onPreferenceChange(HeaderWidthKey.self) { headerWidth = $0 }
     }
 
-    // Delta 5 (7c): a two-pane provider→model popover, not a Menu. Provider and
-    // model are one choice, and browsing a provider's catalog must not switch
-    // what the next message uses — a stock Menu can express neither.
+    // Delta 5 (7c): a cascading provider→model→effort popover, not a Menu.
+    // Effort appears only for models with explicit capability metadata; browsing
+    // any lane must not switch what the next message uses until a row commits.
     private var modelPill: some View {
         Button {
             switcherShown.toggle()
@@ -261,7 +261,8 @@ struct ChatView: View {
     private var switcherLabel: String {
         let provider = providerStore.selectedProvider?.name ?? "No provider"
         let model = providerStore.currentModel
-        return "\(provider) · \(model.isEmpty ? "no model" : model)"
+        let effort = providerStore.currentReasoningEffort.map { " · \($0)" } ?? ""
+        return "\(provider) · \(model.isEmpty ? "no model" : model)\(effort)"
     }
 
     // MARK: - Transcript

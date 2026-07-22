@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+"""Fake `codex app-server` for --smoke-codex-app-server-streaming.
+
+Emits two separate agentMessage items and delays the turn/start JSON-RPC
+response well past the first delta, so the harness can prove (a) partials are
+not buffered behind the response and (b) both items survive into the final text.
+"""
+import sys, json, time
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+def notify(method, params):
+    send({"method": method, "params": params})
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    method, mid = msg.get("method"), msg.get("id")
+    if method == "initialize":
+        send({"id": mid, "result": {}})
+    elif method == "initialized":
+        pass
+    elif method == "account/read":
+        send({"id": mid, "result": {"account": {
+            "type": "chatgpt", "email": "fake@example.test", "planType": "test"}}})
+    elif method == "thread/start":
+        send({"id": mid, "result": {"thread": {"id": "t1"}}})
+    elif method == "thread/inject_items":
+        send({"id": mid, "result": {}})
+    elif method == "turn/start":
+        notify("item/agentMessage/delta", {"delta": "A"})
+        notify("item/completed", {"item": {"type": "agentMessage", "text": "A"}})
+        notify("item/agentMessage/delta", {"delta": "B"})
+        notify("item/completed", {"item": {"type": "agentMessage", "text": "B"}})
+        time.sleep(1.5)          # response arrives long after the first partial
+        send({"id": mid, "result": {}})
+        notify("turn/completed", {"turn": {"status": "completed"}})
+    elif mid is not None:
+        send({"id": mid, "result": {}})

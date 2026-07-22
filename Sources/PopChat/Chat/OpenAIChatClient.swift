@@ -10,6 +10,10 @@ struct ProviderConfig {
     var baseURL: String
     var apiKey: String
     var model: String
+    /// Only set when this exact provider/model advertises reasoning controls.
+    /// Generic OpenAI-compatible endpoints stay nil because `/models` does not
+    /// standardize capability metadata.
+    var reasoningEffort: String? = nil
     var kind: ProviderKind = .openAICompatible
 }
 

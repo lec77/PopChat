@@ -179,7 +179,8 @@ final class ChatStore: ObservableObject {
             persist()
             return
         }
-        if config.kind == .chatGPT {
+        switch config.kind {
+        case .chatGPT:
             if !ChatGPTAuth.isSignedIn {
                 messages.append(ChatMessage(
                     role: .error,
@@ -188,7 +189,15 @@ final class ChatStore: ObservableObject {
                 persist()
                 return
             }
-        } else {
+        case .codexAppServer:
+            // No pre-flight here on purpose. CodexAppServerClient resolves the
+            // executable itself and reports a missing install / missing
+            // `codex login` as an error EVENT, which lands in the transcript
+            // through the same path this branch would use. Repeating the check
+            // duplicates its message (they had already drifted) and puts its
+            // filesystem probing on the main thread in the send path.
+            break
+        case .openAICompatible:
             let isLocal = config.baseURL.contains("localhost") || config.baseURL.contains("127.0.0.1")
             if config.apiKey.isEmpty && !isLocal {
                 messages.append(ChatMessage(
@@ -200,7 +209,12 @@ final class ChatStore: ObservableObject {
             }
         }
 
-        let webAccess = resolveWebAccess(providerBaseURL: config.baseURL)
+        // app-server is intentionally launched with web and connector tools
+        // disabled; don't resolve PopChat's web setting (which can append a
+        // fallback warning) for a provider that cannot consume it.
+        let webAccess = config.kind == .codexAppServer
+            ? nil
+            : resolveWebAccess(providerBaseURL: config.baseURL)
 
         var history = messages
             .filter { $0.role == .user || $0.role == .assistant }
@@ -222,12 +236,18 @@ final class ChatStore: ObservableObject {
         streamingMessageID = assistantMessage.id
 
         // Same event stream either way — only the wire protocol differs.
-        let stream = config.kind == .chatGPT
-            ? CodexResponsesClient.run(
+        let stream: AsyncStream<ChatStreamEvent>
+        switch config.kind {
+        case .chatGPT:
+            stream = CodexResponsesClient.run(
                 history: history, config: config, webAccess: webAccess,
                 sessionID: conversationID.uuidString.lowercased()
             )
-            : OpenAIChatClient.run(history: history, config: config, webAccess: webAccess)
+        case .codexAppServer:
+            stream = CodexAppServerClient.run(history: history, config: config)
+        case .openAICompatible:
+            stream = OpenAIChatClient.run(history: history, config: config, webAccess: webAccess)
+        }
 
         streamTask = Task {
             // The streaming assistant row stays last; activity rows are inserted above it.

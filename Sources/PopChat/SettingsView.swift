@@ -42,6 +42,7 @@ struct SettingsView: View {
     @AppStorage("liquidGlass") private var liquidGlass = true
     @AppStorage("panelTint") private var panelTint = -1.0
     @AppStorage("appearance") private var appearanceRaw = AppearanceChoice.auto.rawValue
+    @AppStorage(CodexAppServerClient.executablePathKey) private var codexExecutablePath = ""
     @FocusState private var focusedCommandName: UUID?
     @Environment(\.colorScheme) private var scheme
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -451,8 +452,20 @@ struct SettingsView: View {
     private func providerSubtitle(_ provider: Provider) -> String {
         if provider.kind == .chatGPT {
             _ = chatGPTAuthTick
-            guard ChatGPTAuth.isSignedIn else { return "Not signed in" }
-            return "Signed in · \(ChatGPTAuth.planLabel ?? "your ChatGPT plan")"
+            guard ChatGPTAuth.isSignedIn else { return "Not signed in · unofficial direct access" }
+            return "Signed in · \(ChatGPTAuth.planLabel ?? "your ChatGPT plan") · unofficial"
+        }
+        if provider.kind == .codexAppServer {
+            switch store.codexAppServerStatus {
+            case .unknown: return "Not checked"
+            case .checking: return "Checking installed Codex…"
+            case .ready(let email, let plan):
+                let detail = [email, plan].compactMap { $0 }.joined(separator: " · ")
+                return detail.isEmpty ? "Installed Codex · signed in" : "Installed Codex · \(detail)"
+            case .missing: return "Codex not found · install it yourself"
+            case .notSignedIn: return "Codex installed · run codex login"
+            case .failed: return "Codex app-server unavailable"
+            }
         }
         let host = URL(string: provider.baseURL)?.host ?? provider.baseURL
         let isLocal = ["localhost", "127.0.0.1"].contains(host)
@@ -483,6 +496,10 @@ struct SettingsView: View {
             // switching rows only has to reload the draft for the new one.
             keyDraft = store.key(for: id)
             editingID = id
+            if store.providers.first(where: { $0.id == id })?.kind == .codexAppServer,
+               store.codexAppServerStatus == .unknown {
+                Task { await store.refreshCodexAppServer(includeModels: true) }
+            }
         }
     }
 
@@ -499,6 +516,8 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 8) {
             if provider.kind == .chatGPT {
                 chatGPTAuthRows
+            } else if provider.kind == .codexAppServer {
+                codexAppServerRows
             } else if let index {
                 if !provider.isPreset {
                     editorField("Name") {
@@ -647,6 +666,75 @@ struct SettingsView: View {
                 .font(.caption)
                 .foregroundStyle(.red)
         }
+        Label {
+            Text("Risk warning: this direct subscription route is unofficial. It calls a ChatGPT/Codex backend that is not documented for third-party apps, so it may stop working and may carry account or terms risk. Prefer the separate Codex app-server provider when possible.")
+        } icon: {
+            Image(systemName: "exclamationmark.triangle.fill")
+        }
+        .font(.caption)
+        .foregroundStyle(.orange)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// Local Codex bridge. Authentication and installation belong to Codex, not
+    /// PopChat, so there is deliberately no install or sign-in button here.
+    @ViewBuilder
+    private var codexAppServerRows: some View {
+        editorField("Codex path") {
+            TextField("Auto-detect", text: $codexExecutablePath)
+                .help("Leave empty to search common locations, or enter the full path to the codex executable.")
+                .onChange(of: codexExecutablePath) { _, _ in
+                    // Not just a status reset: this also bumps the generation so a
+                    // check already running against the OLD path cannot publish
+                    // over this, and clears the once-per-launch auto-fetch flag so
+                    // the switcher will actually re-probe the corrected path.
+                    store.invalidateCodexAppServer()
+                }
+        }
+        HStack(spacing: 8) {
+            switch store.codexAppServerStatus {
+            case .checking:
+                ProgressView().controlSize(.small)
+                Text("Starting codex app-server and checking the account…")
+                    .foregroundStyle(.secondary)
+            case .ready(let email, let plan):
+                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                let detail = [email, plan].compactMap { $0 }.joined(separator: " · ")
+                Text(detail.isEmpty ? "Signed in with ChatGPT" : detail)
+            case .missing:
+                Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
+                Text("Codex executable not found")
+            case .notSignedIn:
+                Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.orange)
+                Text("Codex is not signed in with ChatGPT")
+            case .failed(let message):
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
+                Text(message).lineLimit(2)
+            case .unknown:
+                Image(systemName: "questionmark.circle").foregroundStyle(.secondary)
+                Text("Not checked yet").foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 8)
+            Button("Check Again") {
+                Task { await store.refreshCodexAppServer(includeModels: true) }
+            }
+            .disabled(store.codexAppServerStatus == .checking)
+        }
+        .font(.caption)
+
+        Label {
+            Text("You must install and maintain Codex yourself, then run `codex login` in Terminal. PopChat does not install Codex or copy its credentials; it only starts your local `codex app-server` process. The app-server protocol is experimental, so a Codex update may occasionally be required.")
+        } icon: {
+            Image(systemName: "info.circle.fill")
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+
+        Text("Chat-only safety: PopChat requests ephemeral read-only threads with approval policy Never, and launches Codex with shell/exec, MCP, plugins/connectors, web search, subagents, and other machine tools disabled. The Web Search settings in PopChat do not apply to this provider. Managed Codex policy may override client settings, so app-server remains a local process you should trust and maintain.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     // MARK: - Web Search
@@ -849,4 +937,3 @@ struct SettingsView: View {
         return SecretStore.get(account: account) ?? ""
     }
 }
-

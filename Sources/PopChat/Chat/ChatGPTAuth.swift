@@ -38,6 +38,29 @@ enum ChatGPTAuth {
         "gpt-5.3-codex-spark",
     ]
 
+    /// The direct subscription backend has no model-capabilities endpoint, so this
+    /// is a hand-maintained table — one entry per model, not a rule derived from
+    /// catalog membership. An effort the backend rejects turns EVERY turn on that
+    /// model into a 400 (`reasoning.effort` goes on the wire verbatim), so a value
+    /// only belongs here once it has been seen to work. `medium` is what the client
+    /// hardcoded before the Effort column existed, which is why it is the default
+    /// everywhere except the codex-spark model. "xhigh" is confirmed working
+    /// against this backend (user testing, 2026-07-22).
+    private static let reasoningEfforts: [String: (supported: [String], fallback: String)] = [
+        "gpt-5.5": (["low", "medium", "high", "xhigh"], "medium"),
+        "gpt-5.4": (["low", "medium", "high", "xhigh"], "medium"),
+        "gpt-5.4-mini": (["low", "medium", "high", "xhigh"], "medium"),
+        "gpt-5.3-codex-spark": (["low", "medium", "high", "xhigh"], "high"),
+    ]
+
+    static func supportedReasoningEfforts(for model: String) -> [String] {
+        reasoningEfforts[model]?.supported ?? []
+    }
+
+    static func defaultReasoningEffort(for model: String) -> String? {
+        reasoningEfforts[model]?.fallback
+    }
+
     struct AuthError: LocalizedError {
         let message: String
         /// HTTP status when this came from the token endpoint — lets refresh

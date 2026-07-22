@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""Fake `codex app-server` for --smoke-codex-app-server-backpressure.
+
+Acknowledges setup, then stops draining stdin entirely — the shape of a stalled
+or deadlocked Codex. PopChat's next large write (thread/inject_items carrying a
+long history or an image attachment) blocks once the pipe buffer fills, and the
+adapter must still be able to terminate this process and surface an error.
+
+Reads one byte at a time so the setup replies happen before the stall, without
+Python's line-buffered read-ahead swallowing the oversized payload.
+"""
+import sys, json, time
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+def read_line():
+    chunk = []
+    while True:
+        char = sys.stdin.read(1)
+        if not char:
+            return None
+        if char == "\n":
+            return "".join(chunk)
+        chunk.append(char)
+
+while True:
+    line = read_line()
+    if line is None:
+        break
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    method, mid = msg.get("method"), msg.get("id")
+    if method == "initialize":
+        send({"id": mid, "result": {}})
+    elif method == "initialized":
+        pass
+    elif method == "account/read":
+        send({"id": mid, "result": {"account": {
+            "type": "chatgpt", "email": "fake@example.test", "planType": "test"}}})
+    elif method == "thread/start":
+        send({"id": mid, "result": {"thread": {"id": "t1"}}})
+        break                    # stop reading stdin — the wedge
+    elif mid is not None:
+        send({"id": mid, "result": {}})
+
+while True:                      # stay alive, still not reading
+    time.sleep(1)
