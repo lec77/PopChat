@@ -15,9 +15,9 @@ Native Swift + SwiftUI, no Electron. Menu-bar only, no Dock icon.
 - **Instant panel** — a non-activating `NSPanel`, so showing it never steals focus from
   the app underneath and dismissing it returns focus immediately. Remembers where you
   last dragged it. ⌘P pins it open.
-- **Any OpenAI-compatible provider** — DeepSeek, OpenAI, OpenRouter, Ollama, LM Studio,
-  or any custom endpoint, plus model discovery via `/models`. Switch provider and model
-  from a pill in the panel header.
+- **Any OpenAI-compatible provider** — OpenAI, OpenRouter, Ollama, or any custom endpoint
+  (DeepSeek, Groq, LM Studio, …), plus model discovery via `/models`. Switch provider and
+  model from a pill in the panel header.
 - **Sign in with ChatGPT** — use your own ChatGPT Plus/Pro subscription instead of an API
   key, via the same OAuth flow the Codex CLI uses.
 - **Streaming with a typewriter feel**, a stop button, and errors surfaced in the
@@ -40,15 +40,23 @@ Native Swift + SwiftUI, no Electron. Menu-bar only, no Dock icon.
   exact character range and scrolled into view.
 - **Large editor** (⌘E) — the input capsule morphs into a full draft editor; ⌘↩ sends.
 - **Liquid-glass look** on macOS 26 (translucent panel with an adjustable tint), a solid
-  fallback below that, Light/Dark/Auto appearance, four accent colors, and full support
-  for Reduce Motion / Reduce Transparency.
+  fallback below that, Light/Dark/Auto appearance, four accent presets plus a custom
+  color picker, and full support for Reduce Motion / Reduce Transparency.
 
-## Requirements
+## Install
 
-- macOS 14 or later (the glass backdrop needs macOS 26; older systems get a solid panel)
-- Swift toolchain — Xcode or just the Command Line Tools (`xcode-select --install`)
+Download the latest `PopChat-x.y.z.dmg` from
+[Releases](https://github.com/lec77/PopChat/releases), open it, and drag PopChat to
+Applications. The disk image is signed and notarized, so it opens without a Gatekeeper
+detour. Settings → General has a launch-at-login toggle.
 
-## Build & run
+Requires **macOS 14 or later**. The liquid-glass backdrop needs macOS 26; older systems
+get a solid panel.
+
+## Build from source
+
+Needs a Swift toolchain — Xcode, or just the Command Line Tools
+(`xcode-select --install`).
 
 ```sh
 git clone https://github.com/lec77/PopChat.git
@@ -58,10 +66,9 @@ open dist/PopChat.app
 ```
 
 `./build.sh debug` builds the debug configuration. The script wraps the SwiftPM binary in
-an app bundle and **ad-hoc signs** it — this is a personal-use app, not notarized, so
-Gatekeeper will ask you to confirm the first launch (right-click → Open). Drag
-`dist/PopChat.app` to `/Applications` if you want to keep it; Settings → General has a
-launch-at-login toggle.
+an app bundle and **ad-hoc signs** it, which is fine for a build you made yourself.
+`./release.sh` is the other path — it signs with a Developer ID, builds the disk image,
+and notarizes it; that one only works with my certificate.
 
 There is no Xcode project — it's plain SwiftPM (`Package.swift`) plus `build.sh`.
 
@@ -76,7 +83,8 @@ Open Settings from the menu bar icon or **⌘,** inside the panel.
 - **Commands** — edit the system prompt and define slash commands.
 - **Hotkey** — record whatever global shortcut you want (⌥Space by default).
 
-Local models need no key at all: run Ollama or LM Studio and select the matching preset.
+Local models need no key at all: run Ollama and pick its preset, or point a custom
+endpoint at LM Studio's server.
 
 ### Where things are stored
 
@@ -119,11 +127,15 @@ POPCHAT_API_KEY=… .build/debug/PopChat --smoke-search       # tool-calling loo
 ```
 
 `--smoke-persist`, `--smoke-history`, `--smoke-minsize`, `--smoke-pasteable`,
-`--chatgpt-login` and `--smoke-chatgpt` cover the rest. The performance harnesses fail
-the build on main-thread stalls, so run them after touching the transcript, the composer,
-or panel sizing.
+`--smoke-providers`, `--smoke-accent`, `--smoke-typewriter`, `--chatgpt-login` and
+`--smoke-chatgpt` cover the rest. The performance harnesses fail the build on
+main-thread stalls, so run them after touching the transcript, the composer, or panel
+sizing. Each GUI harness builds a real key window, so run them one at a time rather than
+back-to-back.
 
-The visual design spec lives in [`design/`](design/).
+## License
+
+MIT — see [LICENSE](LICENSE).
 
 ## Status
 

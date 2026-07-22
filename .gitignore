@@ -4,5 +4,7 @@ dist/
 .DS_Store
 .claude/
 
+# Internal working material — kept locally, never published.
 CLAUDE.md
 AGENTS.md
+design/
