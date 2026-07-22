@@ -1913,6 +1913,75 @@ if CommandLine.arguments.contains("--smoke-providers") {
     }
 }
 
+// An LSUIElement app that opens nothing on launch reads as broken, and
+// double-clicking it again — the natural retry — used to be a literal no-op.
+// This drives the REAL launch path with the install marker cleared:
+//   .build/debug/PopChat --smoke-firstrun
+// (a GUI harness: it takes key window, so don't run it beside the others.)
+if CommandLine.arguments.contains("--smoke-firstrun") {
+    let launchDelegate = MainActor.assumeIsolated { AppDelegate() }
+    MainActor.assumeIsolated {
+        let app = NSApplication.shared
+        app.delegate = launchDelegate
+        app.setActivationPolicy(.accessory)
+
+        let defaults = UserDefaults.standard
+        let saved = defaults.object(forKey: AppDelegate.hasLaunchedKey)
+        func restore() {
+            if let saved { defaults.set(saved, forKey: AppDelegate.hasLaunchedKey) }
+            else { defaults.removeObject(forKey: AppDelegate.hasLaunchedKey) }
+        }
+        // Pretend this machine has never run PopChat.
+        defaults.removeObject(forKey: AppDelegate.hasLaunchedKey)
+
+        var failures: [String] = []
+        func check(_ passed: Bool, _ law: String) {
+            print("\(passed ? "ok  " : "FAIL") \(law)")
+            if !passed { failures.append(law) }
+        }
+        func step(_ delay: TimeInterval, _ body: @escaping @MainActor () -> Void) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { MainActor.assumeIsolated(body) }
+        }
+
+        // The launch UI is posted from applicationDidFinishLaunching via
+        // main.async, and the hint waits a further 0.35s behind the panel.
+        step(1.0) {
+            check(launchDelegate.isPanelOnScreen, "first launch opens the panel")
+            check(FirstRunHint.isShowing, "first launch points at the menu bar icon")
+            check(defaults.bool(forKey: AppDelegate.hasLaunchedKey), "the install marker is recorded")
+            check(!FirstRunHint.shortcutDescription.isEmpty, "the hint names a real recorded shortcut")
+
+            FirstRunHint.dismiss()
+            launchDelegate.hidePanel()
+        }
+        // Second launch on the same machine: silent, as it has always been.
+        step(1.5) {
+            launchDelegate.presentLaunchUI(loginItem: false)
+        }
+        step(2.0) {
+            check(!launchDelegate.isPanelOnScreen, "a later launch stays out of the way")
+
+            // ...and a login-item launch stays silent even on a fresh install:
+            // the user asked for PopChat to be READY at boot, not to greet them.
+            defaults.removeObject(forKey: AppDelegate.hasLaunchedKey)
+            launchDelegate.presentLaunchUI(loginItem: true)
+        }
+        step(2.5) {
+            check(!launchDelegate.isPanelOnScreen, "a login-item launch never opens the panel")
+
+            // The headline fix: double-clicking an already-running app.
+            _ = launchDelegate.applicationShouldHandleReopen(app, hasVisibleWindows: false)
+        }
+        step(3.0) {
+            check(launchDelegate.isPanelOnScreen, "reopening the app shows the panel")
+            restore()
+            print(failures.isEmpty ? "PASS" : "FAIL: \(failures.joined(separator: "; "))")
+            exit(failures.isEmpty ? 0 : 1)
+        }
+        app.run()
+    }
+}
+
 // NSApplication.delegate is held unowned — the top-level constant keeps it alive
 // for the app's lifetime.
 let delegate = MainActor.assumeIsolated { AppDelegate() }

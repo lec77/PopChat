@@ -10,6 +10,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private lazy var panelController = PanelController(providerStore: providerStore, shortcutStore: shortcutStore)
     private var settingsWindow: NSWindow?
 
+    /// Hooks for `--smoke-firstrun`, which drives the real launch path.
+    var isPanelOnScreen: Bool { panelController.isPanelOnScreen }
+    func hidePanel() { panelController.hide() }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Auto / Light / Dark (Settings › General): NSApp.appearance reaches every
         // window at once — panel, Settings, popovers; nil follows the system.
@@ -36,11 +40,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             MainActor.assumeIsolated { self?.openSettings() }
         }
 
+        // Read while the launch Apple event is still the current one — by the
+        // time the block below runs it is gone.
+        let loginItem = launchedAsLoginItem
+
         // Build the panel + view hierarchy and load the resumed conversation off
         // the critical path, so the first hotkey press shows a warm panel.
         DispatchQueue.main.async { [weak self] in
             self?.panelController.prewarm()
+            self?.presentLaunchUI(loginItem: loginItem)
         }
+    }
+
+    // MARK: - Being findable at all
+
+    nonisolated static let hasLaunchedKey = "hasLaunchedBefore"
+
+    /// Whether macOS started us at login rather than the user opening the app.
+    /// MUST be read during `applicationDidFinishLaunching` — it inspects the
+    /// launch Apple event, which is only the current event that early. A login
+    /// launch is the one case where showing the panel is wrong: the user asked
+    /// for PopChat to be *ready*, not to greet them at every boot.
+    private var launchedAsLoginItem: Bool {
+        guard let event = NSAppleEventManager.shared().currentAppleEvent,
+              event.eventID == kAEOpenApplication else { return false }
+        return event.paramDescriptor(forKeyword: keyAEPropData)?.enumCodeValue == keyAELaunchedAsLogInItem
+    }
+
+    /// An LSUIElement app that opens nothing looks broken: the status item is
+    /// one of a dozen menu bar glyphs, and nothing on screen names the hotkey.
+    /// So the first launch ever opens the panel and points at the icon once.
+    func presentLaunchUI(loginItem: Bool) {
+        let defaults = UserDefaults.standard
+        let firstLaunch = !defaults.bool(forKey: Self.hasLaunchedKey)
+        defaults.set(true, forKey: Self.hasLaunchedKey)
+        guard firstLaunch, !loginItem else { return }
+
+        // The panel is a non-activating panel, so it can show without stealing
+        // focus — but on a first launch the user just double-clicked us and IS
+        // expecting the foreground.
+        NSApp.activate(ignoringOtherApps: true)
+        panelController.show()
+        // After the panel, never before: the hint is a `.transient` popover and
+        // a window ordering in front of it would dismiss it on the spot.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            guard let button = self?.statusItem.button else { return }
+            FirstRunHint.show(from: button)
+        }
+    }
+
+    /// Double-clicking an already-running LSUIElement app otherwise does
+    /// NOTHING — macOS just reactivates it. That's the exact move someone makes
+    /// when they think the app failed to start, so it has to show the panel.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        FirstRunHint.dismiss()
+        panelController.show()
+        return true
     }
 
     @objc private func statusItemClicked() {

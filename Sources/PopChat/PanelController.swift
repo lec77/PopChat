@@ -113,6 +113,10 @@ final class PanelController: NSObject, NSWindowDelegate {
         return panel
     }()
 
+    /// "Did anything actually appear on screen?" — the question `--smoke-firstrun`
+    /// asks, and the one a new user is really asking when they double-click.
+    var isPanelOnScreen: Bool { panel.isVisible }
+
     func toggle() {
         if !panel.isVisible {
             show()
