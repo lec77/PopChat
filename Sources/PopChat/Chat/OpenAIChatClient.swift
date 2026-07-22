@@ -36,7 +36,7 @@ enum OpenAIChatClient {
         case openRouterPlugin
     }
 
-    private static let maxToolRounds = 5
+    private static let maxToolRounds = 10
 
     /// Message content: a bare string for plain text (maximum provider compatibility)
     /// or an array of typed parts when images are involved.

@@ -271,6 +271,62 @@ if CommandLine.arguments.contains("--check-codex-app-server") {
     RunLoop.main.run()
 }
 
+// LIVE check that the globe toggle actually reaches Codex's own web_search —
+// needs the user's real Codex, signed in. `web_search` is a config ENUM and
+// Codex REFUSES TO START on an unknown variant, so a wrong value here breaks
+// every turn rather than just search; probe A therefore fails loudly if the
+// variant PopChat sends stops being accepted. Probe B is the gate itself.
+//   .build/debug/PopChat --smoke-codex-app-server-search
+if CommandLine.arguments.contains("--smoke-codex-app-server-search") {
+    Task {
+        func turn(webSearch: Bool, model: String) async -> (text: String, searched: Bool, error: String?) {
+            let config = ProviderConfig(baseURL: "", apiKey: "", model: model, kind: .codexAppServer)
+            let history = [OpenAIChatClient.WireMessage(
+                role: "user",
+                content: .text("Search the web: what is the current stable version of Swift? Answer in one line.")
+            )]
+            var text = ""
+            var searched = false
+            var failure: String?
+            for await event in CodexAppServerClient.run(
+                history: history, config: config, webSearch: webSearch, inactivityTimeout: 120
+            ) {
+                switch event {
+                case .partial(let value), .done(let value): text = value
+                case .activity(let value):
+                    if value.contains("searched the web") { searched = true }
+                case .error(let value): failure = value
+                }
+            }
+            return (text, searched, failure)
+        }
+
+        let model: String
+        do {
+            let inspection = try await CodexAppServerClient.inspect(includeModels: true)
+            model = inspection.defaultModel ?? inspection.models.first ?? "gpt-5.1-codex"
+        } catch {
+            print("CODEX-APP-SERVER-ERROR: \(error.localizedDescription)")
+            exit(1)
+        }
+
+        let on = await turn(webSearch: true, model: model)
+        print("globe=on searched=\(on.searched) error=\(on.error ?? "none") text=\(on.text.prefix(120))")
+        let off = await turn(webSearch: false, model: model)
+        print("globe=off searched=\(off.searched) error=\(off.error ?? "none") text=\(off.text.prefix(120))")
+
+        // Search FIRING is model-discretionary, so the pass condition is the
+        // config being accepted (no error, an answer arrives) plus the gate
+        // holding: with the globe off the tool must not exist to be called.
+        let passed = on.error == nil && !on.text.isEmpty
+            && off.error == nil && !off.text.isEmpty
+            && !off.searched
+        print(passed ? "PASS" : "FAIL")
+        exit(passed ? 0 : 1)
+    }
+    RunLoop.main.run()
+}
+
 // Deterministic transport regression harness. Pass a fake app-server executable
 // that sends a delta before acknowledging turn/start; the first partial must not
 // wait for that acknowledgement:

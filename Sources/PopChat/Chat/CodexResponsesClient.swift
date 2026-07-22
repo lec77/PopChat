@@ -15,7 +15,7 @@ import Foundation
 ///   ChatGPTAuth; a 401 retries once after a forced refresh
 enum CodexResponsesClient {
     private static let endpoint = "https://chatgpt.com/backend-api/codex/responses"
-    private static let maxToolRounds = 5
+    private static let maxToolRounds = 10
 
     /// The backend expects a Codex-style `instructions` preamble from clients of
     /// this flow. Kept minimal and honest: PopChat is a chat panel, not a coding

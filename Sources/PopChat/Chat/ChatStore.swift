@@ -114,7 +114,7 @@ final class ChatStore: ObservableObject {
     /// Editable in Settings → Commands; an explicitly empty value means "send
     /// no system prompt".
     nonisolated static let defaultSystemPrompt = """
-    You are PopChat, a helpful assistant in a small desktop chat panel. Be concise and direct.
+    You are a helpful assistant in a small desktop chat panel. Be concise and direct.
 
     When a reply includes content the user will copy and reuse verbatim — a prompt, template, \
     code snippet, configuration, or other reusable text — wrap exactly that content in a \
@@ -209,9 +209,12 @@ final class ChatStore: ObservableObject {
             }
         }
 
-        // app-server is intentionally launched with web and connector tools
-        // disabled; don't resolve PopChat's web setting (which can append a
-        // fallback warning) for a provider that cannot consume it.
+        // Codex owns its own tool loop, so PopChat's client-side tools can't be
+        // injected into it. Don't resolve the engine choice (which can append a
+        // fallback warning) for a provider that cannot consume it — the globe
+        // instead switches Codex's NATIVE web_search on at launch.
+        let codexWebSearch = config.kind == .codexAppServer && Self.webSearchEnabled
+        if codexWebSearch { noteCodexNativeSearch() }
         let webAccess = config.kind == .codexAppServer
             ? nil
             : resolveWebAccess(providerBaseURL: config.baseURL)
@@ -244,7 +247,7 @@ final class ChatStore: ObservableObject {
                 sessionID: conversationID.uuidString.lowercased()
             )
         case .codexAppServer:
-            stream = CodexAppServerClient.run(history: history, config: config)
+            stream = CodexAppServerClient.run(history: history, config: config, webSearch: codexWebSearch)
         case .openAICompatible:
             stream = OpenAIChatClient.run(history: history, config: config, webAccess: webAccess)
         }
@@ -500,6 +503,18 @@ final class ChatStore: ObservableObject {
             return .text(combined)
         }
         return .parts(imageParts + [.text(combined.isEmpty ? "See attached image(s)." : combined)])
+    }
+
+    private static let codexNativeSearchNotice =
+        "Codex runs its own web search — the Search engine setting doesn't apply to this provider."
+
+    /// Codex's native `web_search` ignores the Settings engine choice and
+    /// PopChat's round cap, which the policy says to state rather than degrade
+    /// silently. Once per conversation, though: unlike the per-message
+    /// fallbacks this is a standing property of the provider, not of the turn.
+    private func noteCodexNativeSearch() {
+        guard !messages.contains(where: { $0.text == Self.codexNativeSearchNotice }) else { return }
+        messages.append(ChatMessage(role: .activity, text: Self.codexNativeSearchNotice))
     }
 
     /// Resolves the Settings search-engine choice against the active provider,

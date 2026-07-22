@@ -14,9 +14,11 @@ enum CodexAppServerStatus: Equatable {
 /// Local adapter for Codex's experimental JSONL app-server protocol.
 ///
 /// Each PopChat request gets an ephemeral Codex thread with the resolved PopChat
-/// history injected into it. The thread is read-only, has no network access for
-/// tools, and never asks for an approval: this provider is a chat transport, not
-/// an authorization for Codex to operate on the user's machine.
+/// history injected into it. The thread is read-only, its sandbox has no network
+/// access, and it never asks for an approval: this provider is a chat transport,
+/// not an authorization for Codex to operate on the user's machine. Codex's own
+/// `web_search` is the one exception, since it acts on the backend rather than
+/// the machine — it follows PopChat's globe toggle (see `Session.init`).
 enum CodexAppServerClient {
     static let executablePathKey = "codexExecutablePath"
 
@@ -178,6 +180,7 @@ enum CodexAppServerClient {
     static func run(
         history: [OpenAIChatClient.WireMessage],
         config: ProviderConfig,
+        webSearch: Bool = false,
         executableOverride: URL? = nil,
         inactivityTimeout: TimeInterval = 300
     ) -> AsyncStream<ChatStreamEvent> {
@@ -198,6 +201,7 @@ enum CodexAppServerClient {
                 runTurn(
                     history: history,
                     config: config,
+                    webSearch: webSearch,
                     executableOverride: executableOverride,
                     inactivityTimeout: effectiveTimeout,
                     holder: holder,
@@ -218,6 +222,7 @@ enum CodexAppServerClient {
     private static func runTurn(
         history: [OpenAIChatClient.WireMessage],
         config: ProviderConfig,
+        webSearch: Bool,
         executableOverride: URL?,
         inactivityTimeout: TimeInterval,
         holder: SessionHolder,
@@ -229,7 +234,11 @@ enum CodexAppServerClient {
                 throw ClientError(message: missingMessage, reason: .missing)
             }
             try holder.checkCancellation()
-            let session = try Session(executable: executable, onMessage: { watchdog.kick() })
+            let session = try Session(
+                executable: executable,
+                webSearch: webSearch,
+                onMessage: { watchdog.kick() }
+            )
             holder.set(session)
             defer { session.stop() }
             // The watchdog's clock starts when it is CONSTRUCTED, which is before
@@ -244,9 +253,16 @@ enum CodexAppServerClient {
 
             let split = try splitHistory(history)
             let sandboxDirectory = try appServerWorkingDirectory()
-            let boundary = """
-            You are serving a normal chat inside PopChat. Do not inspect local files, run shell commands, modify files, call MCP tools, spawn agents, or otherwise act on the user's computer. Answer directly from the conversation. PopChat has started this thread with read-only filesystem and no tool network access.
-            """
+            // Say nothing about network when web search is on: the old blanket
+            // "no tool network access" line reads as an instruction not to
+            // search, and the model would obey it over the tool being present.
+            let boundary = webSearch
+                ? """
+                You are serving a normal chat inside PopChat. Do not inspect local files, run shell commands, modify files, call MCP tools, spawn agents, or otherwise act on the user's computer. Answer from the conversation, using web search when the question needs current or external information. PopChat has started this thread with a read-only filesystem and no local tool network access.
+                """
+                : """
+                You are serving a normal chat inside PopChat. Do not inspect local files, run shell commands, modify files, call MCP tools, spawn agents, or otherwise act on the user's computer. Answer directly from the conversation. PopChat has started this thread with read-only filesystem and no tool network access.
+                """
             let developerInstructions = [split.systemPrompt, boundary]
                 .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty }
@@ -709,7 +725,7 @@ private final class Session: @unchecked Sendable {
         signal(SIGPIPE, SIG_IGN)
     }()
 
-    init(executable: URL, onMessage: @escaping @Sendable () -> Void = {}) throws {
+    init(executable: URL, webSearch: Bool = false, onMessage: @escaping @Sendable () -> Void = {}) throws {
         _ = Session.ignoreSIGPIPE
         self.onMessage = onMessage
         process.executableURL = executable
@@ -717,6 +733,18 @@ private final class Session: @unchecked Sendable {
         // machine/connector tool surfaces at process startup as well as using a
         // read-only thread: developer instructions alone are not a security
         // boundary, and read-only would still permit shell-based file reads.
+        //
+        // `web_search` is deliberately NOT in that set. It grants no access to
+        // the user's machine — it runs on the model backend, the sandbox stays
+        // read-only and `networkAccess: false` — and Codex owns its own tool
+        // loop, so this switch is the only web access this provider can have.
+        // It therefore follows PopChat's globe toggle instead of being pinned
+        // off; a fresh process per turn is what makes that a launch argument.
+        // The key is an ENUM (`disabled`/`cached`/`indexed`/`live`) and Codex
+        // refuses to start on an unknown variant, so this is not a Bool spelled
+        // as a string: `live` is what `codex --search` sets, the native
+        // Responses `web_search` tool. `--smoke-codex-app-server-search` is
+        // what catches the variant list changing under us.
         process.arguments = [
             "--disable", "shell_tool",
             "--disable", "unified_exec",
@@ -727,7 +755,7 @@ private final class Session: @unchecked Sendable {
             "--disable", "browser_use",
             "--disable", "computer_use",
             "--disable", "image_generation",
-            "-c", "web_search=\"disabled\"",
+            "-c", "web_search=\"\(webSearch ? "live" : "disabled")\"",
             "-c", "mcp_servers={}",
             "-c", "tools_view_image=false",
             "app-server", "--listen", "stdio://",
