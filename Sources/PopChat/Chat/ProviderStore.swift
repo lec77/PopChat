@@ -87,7 +87,11 @@ final class ProviderStore: ObservableObject {
             // Skip empty baseURLs: the ChatGPT preset's "" would `hasPrefix`-match
             // every legacy base URL and swallow the migrated key under a provider
             // that has no key field to recover it from.
-            let target = providers.first { !legacyBase.isEmpty && !$0.baseURL.isEmpty && legacyBase.hasPrefix($0.baseURL) } ?? providers[0]
+            // Same reason for the fallback: the first preset IS the ChatGPT one now,
+            // and it has no key field to recover a misfiled key from.
+            let target = providers.first { !legacyBase.isEmpty && !$0.baseURL.isEmpty && legacyBase.hasPrefix($0.baseURL) }
+                ?? providers.first { !$0.baseURL.isEmpty }
+                ?? providers[0]
             SecretStore.set(legacyKey, account: target.id.uuidString)
             if let legacyModel = d.string(forKey: "providerModel") {
                 selectedModels[target.id] = legacyModel
@@ -99,6 +103,17 @@ final class ProviderStore: ObservableObject {
         }
 
         var migrated = providers
+        // Retired presets: drop the untouched ones, keep anything set up (see
+        // `retiredPresetNames`). Runs before the ChatGPT healing below so a list
+        // that ends up empty still gets that preset inserted.
+        let knownModels = Self.loadJSON([UUID: [String]].self, key: Keys.knownModels) ?? [:]
+        migrated.removeAll { provider in
+            guard provider.isPreset, Self.retiredPresetNames.contains(provider.name) else { return false }
+            let configured = !(SecretStore.get(account: provider.id.uuidString) ?? "").isEmpty
+                || !(knownModels[provider.id] ?? []).isEmpty
+                || selectedModels[provider.id] != nil
+            return !configured && provider.id != selectedID
+        }
         // Provider lists saved before the ChatGPT preset existed: add it once.
         if !migrated.contains(where: { $0.kind == .chatGPT }) {
             if let index = migrated.firstIndex(where: { $0.isPreset && Self.chatGPTProviderNames.contains($0.name) }) {
@@ -124,7 +139,7 @@ final class ProviderStore: ObservableObject {
 
         self.providers = migrated
         self.selectedID = selectedID ?? migrated[0].id
-        self.knownModels = Self.loadJSON([UUID: [String]].self, key: Keys.knownModels) ?? [:]
+        self.knownModels = knownModels
         self.selectedModels = selectedModels
         // didSet does not fire during init — persist the seeded/migrated state explicitly.
         persistJSON(self.providers, key: Keys.providers)
@@ -158,14 +173,19 @@ final class ProviderStore: ObservableObject {
 
     static func presets() -> [Provider] {
         [
-            Provider(id: UUID(), name: "DeepSeek", baseURL: "https://api.deepseek.com", isPreset: true, defaultModel: "deepseek-chat"),
             chatGPTPreset(),
             Provider(id: UUID(), name: "OpenAI", baseURL: "https://api.openai.com/v1", isPreset: true, defaultModel: "gpt-4o"),
             Provider(id: UUID(), name: "OpenRouter", baseURL: "https://openrouter.ai/api/v1", isPreset: true, defaultModel: "openrouter/auto"),
             Provider(id: UUID(), name: "Ollama (local)", baseURL: "http://localhost:11434/v1", isPreset: true, defaultModel: ""),
-            Provider(id: UUID(), name: "LM Studio (local)", baseURL: "http://localhost:1234/v1", isPreset: true, defaultModel: ""),
         ]
     }
+
+    /// Presets dropped 2026-07-22. They stay in an existing list only while the
+    /// user has actually set them up — a key, a fetched model list, a chosen
+    /// model, or the live selection. Nothing can re-add them (they are gone from
+    /// `presets()` and a hand-added one is `isPreset: false`), so this needs no
+    /// one-shot flag; it just never finds anything to drop after the first launch.
+    static let retiredPresetNames: Set<String> = ["DeepSeek", "LM Studio (local)"]
 
     // MARK: - Selection
 
