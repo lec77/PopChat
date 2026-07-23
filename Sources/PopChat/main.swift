@@ -338,8 +338,13 @@ if CommandLine.arguments.contains("--smoke-codex-app-server-search") {
 }
 
 // Deterministic transport regression harness. Pass a fake app-server executable
-// that sends a delta before acknowledging turn/start; the first partial must not
-// wait for that acknowledgement:
+// (Tools/fake-codex-stream) that sends a delta before acknowledging turn/start,
+// REPLAYS an item/completed, and fails mid-item with a willRetry error before
+// re-delivering under a new item id. Laws, in order: the first partial must not
+// wait for the turn/start acknowledgement; both completed items must survive;
+// the replayed completion must not duplicate its item; the retryable error must
+// drop the aborted in-flight partial (never glue the re-stream onto it) and
+// surface a transient retry status instead of silence:
 //   .build/debug/PopChat --smoke-codex-app-server-streaming /path/to/fake-codex
 if let flag = CommandLine.arguments.firstIndex(of: "--smoke-codex-app-server-streaming"),
    CommandLine.arguments.count > flag + 1 {
@@ -349,6 +354,9 @@ if let flag = CommandLine.arguments.firstIndex(of: "--smoke-codex-app-server-str
         var firstPartialDelay: TimeInterval?
         var final = ""
         var failure: String?
+        var sawAborted = false
+        var sawGlued = false
+        var sawRetryStatus = false
         let config = ProviderConfig(
             baseURL: "", apiKey: "", model: "fake-model",
             kind: .codexAppServer
@@ -362,10 +370,14 @@ if let flag = CommandLine.arguments.firstIndex(of: "--smoke-codex-app-server-str
             switch event {
             case .partial(let text):
                 if firstPartialDelay == nil { firstPartialDelay = Date().timeIntervalSince(started) }
+                if text.contains("half-answer") { sawAborted = true }
+                if text.contains("replacesC") { sawGlued = true }
                 final = text
             case .done(let text):
                 final = text
-            case .activity, .status:
+            case .status(let text):
+                if text.localizedCaseInsensitiveContains("retrying") { sawRetryStatus = true }
+            case .activity:
                 break
             case .error(let message):
                 failure = message
@@ -373,13 +385,16 @@ if let flag = CommandLine.arguments.firstIndex(of: "--smoke-codex-app-server-str
         }
         let delay = firstPartialDelay ?? .infinity
         let lead = Date().timeIntervalSince(started) - delay
-        // The fake server completes two separate agentMessage items. Both must
-        // survive into the final snapshot as well as the first delta arriving
-        // before the delayed turn/start acknowledgement.
-        let passed = failure == nil && final == "A\n\nB" && lead > 1.0
+        // final == exactly the three items: the replayed completion of B would
+        // make it four, and the aborted "half-answer…" partial must have been
+        // streamed (sawAborted) but dropped rather than glued to C (sawGlued).
+        let passed = failure == nil && final == "A\n\nB\n\nC" && lead > 1.0
+            && sawAborted && !sawGlued && sawRetryStatus
         print(String(
-            format: "first-partial=%.3fs lead=%.3fs final=%@ %@",
-            delay, lead, final.replacingOccurrences(of: "\n", with: "\\n"),
+            format: "first-partial=%.3fs lead=%.3fs aborted=%@ glued=%@ retry-status=%@ final=%@ %@",
+            delay, lead,
+            sawAborted ? "yes" : "no", sawGlued ? "yes" : "no", sawRetryStatus ? "yes" : "no",
+            final.replacingOccurrences(of: "\n", with: "\\n"),
             passed ? "PASS" : "FAIL"
         ))
         if let failure { print("ERROR: \(failure)") }

@@ -38,7 +38,7 @@ Three harnesses drive a fake app-server instead of the real one, so they cost no
 .build/debug/PopChat --smoke-codex-app-server-backpressure Tools/fake-codex-wedge
 ```
 
-They guard, in order: JSONL notification ordering plus multi-item turns (both agent messages must survive, and the first delta must not wait on the `turn/start` response); recovery from a process that goes silent mid-turn; and the rule that a process which stops draining its stdin cannot wedge PopChat — never hold a lock across the blocking write, or Stop and the watchdog both block behind it.
+They guard, in order: turn assembly and notification ordering (both agent messages must survive, the first delta must not wait on the `turn/start` response, a replayed `item/completed` must not duplicate its item, and a `willRetry` error must drop the aborted in-flight partial and surface a retry status rather than gluing the re-stream onto it in silence); recovery from a process that goes silent mid-turn; and the rule that a process which stops draining its stdin cannot wedge PopChat — never hold a lock across the blocking write, or Stop and the watchdog both block behind it.
 
 Two rules when running these:
 

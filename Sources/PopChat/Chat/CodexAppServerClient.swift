@@ -464,15 +464,10 @@ enum CodexAppServerClient {
             continuation.yield(.status("Waiting for \(config.model)…"))
             let turnRequestID = try session.beginRequest(method: "turn/start", params: turnParams)
             // A turn can produce SEVERAL agentMessage items (a preamble, then the
-            // answer). Deltas belong to the item currently streaming, and
-            // `item/completed` is authoritative for THAT item only — folding it
-            // into one running string drops every item that completed before it.
-            var completedItems: [String] = []
-            var streamingItem = ""
-            func snapshot() -> String {
-                (completedItems + (streamingItem.isEmpty ? [] : [streamingItem]))
-                    .joined(separator: "\n\n")
-            }
+            // answer), and the protocol keys every delta and completion by item
+            // id. `ItemAssembly` holds that shape; its doc comment carries the
+            // laws (authoritative idempotent completions, willRetry semantics).
+            var items = ItemAssembly()
             var finished = false
             while !finished, let message = try session.nextMessage() {
                 try holder.checkCancellation()
@@ -485,8 +480,10 @@ enum CodexAppServerClient {
                 switch method {
                 case "item/agentMessage/delta":
                     if let delta = params["delta"]?.stringValue {
-                        streamingItem += delta
-                        continuation.yield(.partial(snapshot()))
+                        // `itemId` is required by the protocol; "" is a last-resort
+                        // key so a nonconforming server still streams.
+                        items.delta(id: params["itemId"]?.stringValue ?? "", text: delta)
+                        continuation.yield(.partial(items.snapshot))
                     }
                 case "item/started":
                     if let activity = activityLabel(item: params["item"]?.objectValue) {
@@ -508,28 +505,34 @@ enum CodexAppServerClient {
                     guard let item = params["item"]?.objectValue else { continue }
                     switch item["type"]?.stringValue {
                     case "agentMessage":
-                        // The completed item's own text wins over the deltas we
-                        // reassembled for it; fall back to those if it carries none.
-                        let text = item["text"]?.stringValue ?? ""
-                        let settled = text.isEmpty ? streamingItem : text
-                        streamingItem = ""
-                        if !settled.isEmpty { completedItems.append(settled) }
-                        continuation.yield(.partial(snapshot()))
+                        items.completed(
+                            id: item["id"]?.stringValue ?? "",
+                            text: item["text"]?.stringValue ?? ""
+                        )
+                        continuation.yield(.partial(items.snapshot))
                     case "webSearch":
                         continuation.yield(.activity(webSearchLabel(item)))
                     default:
                         break
                     }
                 case "error":
-                    let willRetry = params["willRetry"]?.boolValue ?? false
-                    if !willRetry, let message = params["error"]?.objectValue?["message"]?.stringValue {
+                    if params["willRetry"]?.boolValue == true {
+                        // Codex is about to re-deliver the aborted attempt, so an
+                        // in-flight partial would double up with the re-stream —
+                        // drop it, and say what the pause is instead of stalling
+                        // silently.
+                        if items.dropInFlight() {
+                            continuation.yield(.partial(items.snapshot))
+                        }
+                        continuation.yield(.status("Temporary error — Codex is retrying…"))
+                    } else if let message = params["error"]?.objectValue?["message"]?.stringValue {
                         continuation.yield(.error(friendlyError(message)))
                     }
                 case "turn/completed":
                     let turn = params["turn"]?.objectValue
                     let status = turn?["status"]?.stringValue ?? "failed"
                     if status == "completed" || status == "interrupted" {
-                        continuation.yield(.done(snapshot()))
+                        continuation.yield(.done(items.snapshot))
                     } else {
                         let message = turn?["error"]?.objectValue?["message"]?.stringValue
                             ?? "Codex app-server turn failed (status: \(status))."
@@ -562,6 +565,64 @@ enum CodexAppServerClient {
             } else if !holder.isStopped {
                 continuation.yield(.error("Codex app-server failed: \(error.localizedDescription)"))
             }
+        }
+    }
+
+    /// Ordered assembly of one turn's agentMessage items.
+    ///
+    /// The app-server protocol requires `itemId` on every agentMessage delta and
+    /// `item.id` on every completion (schema: `AgentMessageDeltaNotification` /
+    /// `AgentMessageThreadItem`), so assembly must honor that keying rather than
+    /// folding deltas into one running string:
+    /// - a delta appends to ITS item, never to whichever item streamed last;
+    /// - `item/completed` text is authoritative for its id, and a REPLAYED
+    ///   completion settles the same entry again instead of appending a
+    ///   duplicate item;
+    /// - a retryable turn error (`willRetry: true`) drops in-flight items only:
+    ///   the retry re-delivers the aborted item's content, and appending that
+    ///   re-stream onto the aborted half is exactly the prefix-duplication bug.
+    ///   Completed items are not re-sent, so they stay.
+    struct ItemAssembly {
+        private struct Entry {
+            var id: String
+            var text: String
+            var completed: Bool
+        }
+
+        private var entries: [Entry] = []
+
+        mutating func delta(id: String, text: String) {
+            if let index = entries.lastIndex(where: { $0.id == id }) {
+                // A delta for an id that already settled is a replay; the
+                // completed text is authoritative, so late deltas are noise.
+                guard !entries[index].completed else { return }
+                entries[index].text += text
+            } else {
+                entries.append(Entry(id: id, text: text, completed: false))
+            }
+        }
+
+        mutating func completed(id: String, text: String) {
+            if let index = entries.lastIndex(where: { $0.id == id }) {
+                // The item's own text wins over the deltas reassembled for it;
+                // fall back to those when it carries none.
+                if !text.isEmpty { entries[index].text = text }
+                entries[index].completed = true
+            } else if !text.isEmpty {
+                entries.append(Entry(id: id, text: text, completed: true))
+            }
+        }
+
+        /// Reports whether anything was dropped, so the caller knows the
+        /// visible snapshot shrank and must be re-yielded.
+        mutating func dropInFlight() -> Bool {
+            let count = entries.count
+            entries.removeAll { !$0.completed }
+            return entries.count != count
+        }
+
+        var snapshot: String {
+            entries.map(\.text).filter { !$0.isEmpty }.joined(separator: "\n\n")
         }
     }
 

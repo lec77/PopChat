@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """Fake `codex app-server` for --smoke-codex-app-server-streaming.
 
-Emits two separate agentMessage items and delays the turn/start JSON-RPC
-response well past the first delta, so the harness can prove (a) partials are
-not buffered behind the response and (b) both items survive into the final text.
+Scenario, in order (all notifications schema-conforming: deltas carry the
+required itemId, items carry their required id):
+1. two agentMessage items complete normally, with the turn/start JSON-RPC
+   response delayed well past the first delta — partials must not be buffered
+   behind the response, and both items must survive into the final text;
+2. the second item's completion is REPLAYED — it must not duplicate;
+3. a third item fails mid-stream with a willRetry error and is re-delivered
+   under a NEW item id — the aborted half must be dropped, never glued onto
+   the re-stream.
 """
 import sys, json, time
 
@@ -13,6 +19,15 @@ def send(obj):
 
 def notify(method, params):
     send({"method": method, "params": params})
+
+def delta(item_id, text):
+    notify("item/agentMessage/delta", {
+        "threadId": "t1", "turnId": "u1", "itemId": item_id, "delta": text})
+
+def completed(item_id, text):
+    notify("item/completed", {
+        "threadId": "t1", "turnId": "u1", "completedAtMs": 0,
+        "item": {"type": "agentMessage", "id": item_id, "text": text}})
 
 for line in sys.stdin:
     line = line.strip()
@@ -32,11 +47,18 @@ for line in sys.stdin:
     elif method == "thread/inject_items":
         send({"id": mid, "result": {}})
     elif method == "turn/start":
-        notify("item/agentMessage/delta", {"delta": "A"})
-        notify("item/completed", {"item": {"type": "agentMessage", "text": "A"}})
-        notify("item/agentMessage/delta", {"delta": "B"})
-        notify("item/completed", {"item": {"type": "agentMessage", "text": "B"}})
-        time.sleep(1.5)          # response arrives long after the first partial
+        delta("m1", "A")
+        completed("m1", "A")
+        delta("m2", "B")
+        completed("m2", "B")
+        completed("m2", "B")   # replayed completion — must not duplicate
+        delta("m3", "half-answer-the-retry-replaces")   # aborted attempt
+        notify("error", {
+            "threadId": "t1", "turnId": "u1", "willRetry": True,
+            "error": {"message": "response stream disconnected"}})
+        delta("m4", "C")       # the retry re-delivers under a new id
+        completed("m4", "C")
+        time.sleep(1.5)        # response arrives long after the first partial
         send({"id": mid, "result": {}})
         notify("turn/completed", {"turn": {"status": "completed"}})
     elif mid is not None:
