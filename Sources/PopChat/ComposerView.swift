@@ -603,11 +603,30 @@ struct ComposerView: View {
                     }
                 }
             }
+            // fixedSize(vertical) on both notices is what keeps them whole: the
+            // empty panel's height FOLLOWS the measured content, so a Text that
+            // yields to the current (still-short) window truncates or paints past
+            // the card, and the height report never learns the missing lines.
             if let notice = model.attachNotice {
-                Label(notice, systemImage: "exclamationmark.triangle.fill")
-                    .font(.system(size: 11))
-                    .foregroundStyle(scheme == .dark ? Theme.warningOrange : Theme.warningTextLight)
-                    .textSelection(.enabled)
+                HStack(alignment: .top, spacing: 6) {
+                    Label(notice, systemImage: "exclamationmark.triangle.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(scheme == .dark ? Theme.warningOrange : Theme.warningTextLight)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                    Spacer(minLength: 0)
+                    Button {
+                        model.attachNotice = nil
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 18, height: 18)
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Dismiss")
+                }
             }
         }
         .padding(10)

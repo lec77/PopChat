@@ -1713,6 +1713,125 @@ if CommandLine.arguments.contains("--smoke-drop") {
     }
 }
 
+// Attach-notice guard: builds the REAL empty panel and drops unsupported
+// .pptx files through the real PanelDropView path, so the failure notice
+// renders exactly as a user sees it. The law: a notice is never
+// height-compressed — the empty panel's height FOLLOWS measured content, so a
+// Text that yields to the still-short window truncates (or paints past the
+// card) and the height report never learns the missing lines. Discriminator:
+// a long notice must settle TALLER than a short one; under the bug both
+// truncate to the same single line and the delta collapses to zero.
+// `--smoke-notice [png-path]` (optional PNG for eyeballing). A GUI harness —
+// run it alone, like the other panel harnesses.
+if let noticeIndex = CommandLine.arguments.firstIndex(of: "--smoke-notice") {
+    MainActor.assumeIsolated {
+        var pngPath: String?
+        if CommandLine.arguments.count > noticeIndex + 1,
+           !CommandLine.arguments[noticeIndex + 1].hasPrefix("--") {
+            pngPath = CommandLine.arguments[noticeIndex + 1]
+        }
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        app.appearance = NSAppearance(named: .darkAqua)
+
+        // Narrow width so the notice wraps; solid panel so the offscreen bitmap
+        // is readable (glass has no backdrop to composite there).
+        let defaults = UserDefaults.standard
+        let priorWidth = defaults.object(forKey: "panelWidth")
+        let priorGlass = defaults.object(forKey: "liquidGlass")
+        defaults.set(520, forKey: "panelWidth")
+        defaults.set(false, forKey: "liquidGlass")
+
+        let controller = PanelController(providerStore: ProviderStore(), shortcutStore: ShortcutStore())
+        controller.chatStore.newChat()
+        controller.show()
+
+        // Width is read once at panel init — safe to put back now. liquidGlass is
+        // live @AppStorage: restoring it early would flip the panel back to glass
+        // mid-run, so it goes back on the way out.
+        if let priorWidth { defaults.set(priorWidth, forKey: "panelWidth") } else { defaults.removeObject(forKey: "panelWidth") }
+        @MainActor func finish(_ code: Int32) -> Never {
+            if let priorGlass { defaults.set(priorGlass, forKey: "liquidGlass") } else { defaults.removeObject(forKey: "liquidGlass") }
+            exit(code)
+        }
+
+        @MainActor func findDropView(_ view: NSView?) -> PanelDropView? {
+            guard let view else { return nil }
+            if let drop = view as? PanelDropView { return drop }
+            for sub in view.subviews { if let found = findDropView(sub) { return found } }
+            return nil
+        }
+
+        // The refusal keys on NUL bytes (loadPlainText), not the extension —
+        // a zip-style header with zeros is what makes the fake decks "binary".
+        let names = ["SkVM_ 7-11.pptx",
+                     "A quarterly all-hands deck with a truly unreasonable filename 2026-07 final v3.pptx"]
+        let files = names.map { FileManager.default.temporaryDirectory.appendingPathComponent($0) }
+        for file in files {
+            try? Data([0x50, 0x4B, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).write(to: file)
+        }
+        @MainActor func cleanUpFiles() {
+            for file in files { try? FileManager.default.removeItem(at: file) }
+        }
+
+        @MainActor func drop(_ file: URL) {
+            guard let panel = app.windows.first(where: { $0 is FloatingPanel }),
+                  let view = findDropView(panel.contentView) else {
+                print("FAIL: no panel or drop view"); cleanUpFiles(); finish(1)
+            }
+            let pasteboard = NSPasteboard(name: NSPasteboard.Name("popchat-smoke-notice"))
+            pasteboard.clearContents()
+            pasteboard.writeObjects([file as NSURL])
+            guard view.handleDrop(from: pasteboard) else {
+                print("FAIL: drop not handled"); cleanUpFiles(); finish(1)
+            }
+        }
+        @MainActor func settledHeight() -> CGFloat {
+            guard let panel = app.windows.first(where: { $0 is FloatingPanel }) else {
+                print("FAIL: no panel"); cleanUpFiles(); finish(1)
+            }
+            return panel.contentRect(forFrameRect: panel.frame).height
+        }
+
+        var shortHeight: CGFloat = 0
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            MainActor.assumeIsolated { drop(files[0]) }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+            MainActor.assumeIsolated {
+                shortHeight = settledHeight()
+                drop(files[1])
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.2) {
+            MainActor.assumeIsolated {
+                let longHeight = settledHeight()
+                if let pngPath,
+                   let panel = app.windows.first(where: { $0 is FloatingPanel }),
+                   let view = panel.contentView,
+                   let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+                    view.cacheDisplay(in: view.bounds, to: rep)
+                    if let data = rep.representation(using: .png, properties: [:]) {
+                        try? data.write(to: URL(fileURLWithPath: pngPath))
+                        print("wrote \(pngPath)")
+                    }
+                }
+                cleanUpFiles()
+                print("short-notice contentH=\(Int(shortHeight)) long-notice contentH=\(Int(longHeight))")
+                // One extra wrapped line is ~14pt; a compressed notice collapses
+                // the delta to ~0 because both truncate to the same height.
+                guard longHeight - shortHeight >= 10 else {
+                    print("FAIL: a longer notice must grow the panel — it is being truncated")
+                    finish(1)
+                }
+                print("PASS")
+                finish(0)
+            }
+        }
+        app.run()
+    }
+}
+
 // Design QA: renders a view to PNG in-process (`--shot <settings|switcher> <path>`),
 // so the layout can be checked without screen-recording permission.
 if let shotIndex = CommandLine.arguments.firstIndex(of: "--shot"),
