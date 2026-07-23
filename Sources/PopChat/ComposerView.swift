@@ -39,14 +39,20 @@ final class ComposerModel: ObservableObject {
             return
         }
         if pasteboard.string(forType: .string) == nil, let image = NSImage(pasteboard: pasteboard) {
-            attachNotice = nil
-            switch AttachmentLoader.load(image: image, suggestedName: "pasted-image.jpg") {
-            case .success(let attachment):
-                pendingAttachments.append(attachment)
-                updateSizeWarning()
-            case .failure(let error):
-                attachNotice = error.message
-            }
+            handleImage(image, suggestedName: "pasted-image.jpg")
+        }
+    }
+
+    /// Raw image data with no backing file — pasted screenshots and drags whose
+    /// pasteboard offers only bitmap data (e.g. an image out of a browser).
+    func handleImage(_ image: NSImage, suggestedName: String) {
+        attachNotice = nil
+        switch AttachmentLoader.load(image: image, suggestedName: suggestedName) {
+        case .success(let attachment):
+            pendingAttachments.append(attachment)
+            updateSizeWarning()
+        case .failure(let error):
+            attachNotice = error.message
         }
     }
 

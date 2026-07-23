@@ -1584,6 +1584,135 @@ if CommandLine.arguments.contains("--smoke-accent") {
     exit(0)
 }
 
+// Drop-target laws (no GUI, no network): .build/debug/PopChat --smoke-drop
+//
+// "Drag a fresh screenshot in" is a FILE-PROMISE drag: the PNG doesn't exist
+// on disk until the destination receives the promise, so the old URL-only
+// `.dropDestination(for: URL.self)` ignored it — that was the bug. In-process
+// promise RESOLUTION cannot be simulated (the pasteboard server never calls a
+// source back inside its own process — verified while writing this), so the
+// promise law checks acceptance and that the receive was initiated; a live
+// screenshot-thumbnail drag is the end-to-end check.
+if CommandLine.arguments.contains("--smoke-drop") {
+    MainActor.assumeIsolated {
+        func fail(_ message: String) -> Never {
+            print("FAIL: \(message)")
+            exit(1)
+        }
+        func pump(timeout: TimeInterval, until check: () -> Bool, what: String) {
+            let deadline = Date().addingTimeInterval(timeout)
+            while !check() {
+                guard Date() < deadline else { fail("timed out waiting for \(what)") }
+                RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
+            }
+        }
+        final class PromiseSource: NSObject, NSFilePromiseProviderDelegate {
+            func filePromiseProvider(_ provider: NSFilePromiseProvider, fileNameForType fileType: String) -> String {
+                "Screenshot Smoke.png"
+            }
+            func filePromiseProvider(_ provider: NSFilePromiseProvider, writePromiseTo url: URL, completionHandler: @escaping (Error?) -> Void) {
+                // Never reached in-process; the law only needs the promise on
+                // the pasteboard to be well-formed.
+                completionHandler(NSError(domain: "smoke-drop", code: 1))
+            }
+        }
+        func scratchPasteboard(_ suffix: String) -> NSPasteboard {
+            let pasteboard = NSPasteboard(name: .init("popchat-smoke-drop-\(suffix)-\(ProcessInfo.processInfo.processIdentifier)"))
+            pasteboard.clearContents()
+            return pasteboard
+        }
+
+        let view = PanelDropView()
+        let model = ComposerModel()
+        view.onFileURLs = { model.handleFiles($0) }
+        view.onImage = { model.handleImage($0, suggestedName: "dropped-image.jpg") }
+        view.onError = { model.attachNotice = $0 }
+
+        // 1. Registration: refuse any of these types and the drag never even
+        //    highlights the panel. The promise list is the screenshot thumbnail.
+        let registered = Set(view.registeredDraggedTypes.map(\.rawValue))
+        for type in NSFilePromiseReceiver.readableDraggedTypes where !registered.contains(type) {
+            fail("not registered for promise type \(type) — a screenshot-thumbnail drag would be refused")
+        }
+        for type in [NSPasteboard.PasteboardType.fileURL, .png, .tiff] where !registered.contains(type.rawValue) {
+            fail("not registered for \(type.rawValue)")
+        }
+
+        // 2. A promise-only drag (the screenshot thumbnail) is accepted and
+        //    initiates a receive; nothing attaches synchronously.
+        let promiseSource = PromiseSource()
+        let promisePasteboard = scratchPasteboard("promise")
+        guard promisePasteboard.writeObjects([NSFilePromiseProvider(fileType: "public.png", delegate: promiseSource)]) else {
+            fail("couldn't write a file promise to the scratch pasteboard")
+        }
+        guard view.accepts(promisePasteboard) else { fail("a file-promise drag is not accepted") }
+        guard view.handleDrop(from: promisePasteboard) else { fail("a file-promise drop was not handled") }
+        guard model.pendingAttachments.isEmpty else { fail("a promise drop attached synchronously — it must wait for the promised file") }
+        guard let promiseDestination = view.lastPromiseDestination,
+              FileManager.default.fileExists(atPath: promiseDestination.path) else {
+            fail("a promise drop did not initiate a receive into a destination directory")
+        }
+
+        // 3. A plain file-URL drag still attaches end-to-end.
+        let textURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("popchat-smoke-drop-\(ProcessInfo.processInfo.processIdentifier).txt")
+        do { try "drop smoke".write(to: textURL, atomically: true, encoding: .utf8) } catch {
+            fail("couldn't write scratch file: \(error.localizedDescription)")
+        }
+        defer { try? FileManager.default.removeItem(at: textURL) }
+        let filePasteboard = scratchPasteboard("file")
+        guard filePasteboard.writeObjects([textURL as NSURL]) else { fail("couldn't write the file URL") }
+        guard view.accepts(filePasteboard), view.handleDrop(from: filePasteboard) else { fail("a file-URL drop was not handled") }
+        pump(timeout: 5, until: { !model.pendingAttachments.isEmpty }, what: "the file-URL attachment")
+        guard case .text(let text) = model.pendingAttachments[0].content, text.contains("drop smoke") else {
+            fail("the file-URL drop did not attach the file's text")
+        }
+
+        // 4. Raw image data with no file behind it (browser image drags; also
+        //    the screenshot path on pasteboards that carry bitmap data).
+        model.clear()
+        let image = NSImage(size: NSSize(width: 12, height: 12), flipped: false) { rect in
+            NSColor.systemRed.setFill()
+            rect.fill()
+            return true
+        }
+        let imagePasteboard = scratchPasteboard("image")
+        guard imagePasteboard.writeObjects([image]) else { fail("couldn't write the image") }
+        guard view.accepts(imagePasteboard), view.handleDrop(from: imagePasteboard) else { fail("a raw-image drop was not handled") }
+        guard model.pendingAttachments.count == 1, case .image = model.pendingAttachments[0].content else {
+            fail("the raw-image drop did not attach an image")
+        }
+
+        // 5. Priority: file URLs beat promises (no pointless copy through the
+        //    temp dir) and beat image data (a Finder drag can carry the file
+        //    icon as an image — matching images first would attach the icon).
+        model.clear()
+        let mixedPasteboard = scratchPasteboard("mixed")
+        guard mixedPasteboard.writeObjects([
+            textURL as NSURL,
+            NSFilePromiseProvider(fileType: "public.png", delegate: promiseSource),
+            image,
+        ]) else { fail("couldn't write the mixed drag") }
+        guard view.handleDrop(from: mixedPasteboard) else { fail("the mixed drop was not handled") }
+        pump(timeout: 5, until: { !model.pendingAttachments.isEmpty }, what: "the mixed-drop attachment")
+        guard model.pendingAttachments.count == 1, case .text = model.pendingAttachments[0].content else {
+            fail("a drag carrying a file URL must attach the file, not the image data")
+        }
+        guard view.lastPromiseDestination == promiseDestination else {
+            fail("a drag carrying a file URL must not also receive its file promise")
+        }
+
+        // 6. A text-only drag is someone dragging selected text — not ours.
+        let stringPasteboard = scratchPasteboard("string")
+        stringPasteboard.setString("just text", forType: .string)
+        guard !view.accepts(stringPasteboard) else { fail("a text-only drag must not be accepted") }
+        guard !view.handleDrop(from: stringPasteboard) else { fail("a text-only drop must not be handled") }
+
+        print("OK: promise accepted + receive initiated, file URL and raw image attach, URL-first priority, text refused")
+        exit(0)
+    }
+}
+
 // Design QA: renders a view to PNG in-process (`--shot <settings|switcher> <path>`),
 // so the layout can be checked without screen-recording permission.
 if let shotIndex = CommandLine.arguments.firstIndex(of: "--shot"),

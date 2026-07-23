@@ -81,12 +81,10 @@ struct ChatView: View {
         // No SwiftUI min frame here: the window enforces minimums (PanelController
         // windowWillResize). A root larger than the window would render CENTERED
         // in it, clipping the pills and composer off the top/bottom edges.
-        .dropDestination(for: URL.self) { urls, _ in
-            composerModel.handleFiles(urls)
-            return true
-        } isTargeted: { targeted in
-            dropTargeted = targeted
-        }
+        // AppKit drop target, NOT `.dropDestination(for: URL.self)`: the
+        // screenshot thumbnail's drag carries a file PROMISE, no URL — see
+        // PanelDrop.swift. Guarded by --smoke-drop.
+        .background { PanelDropCatcher(targeted: $dropTargeted, model: composerModel) }
         .onExitCommand { onClose() }
         // While the history popover is key, ITS ⌘F wins (popovers get their own
         // window), which is what "⌘F in history searches the histories" means.
