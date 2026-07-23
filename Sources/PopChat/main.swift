@@ -281,7 +281,7 @@ if CommandLine.arguments.contains("--check-codex-app-server") {
 //   .build/debug/PopChat --smoke-codex-app-server-search
 if CommandLine.arguments.contains("--smoke-codex-app-server-search") {
     Task {
-        func turn(webSearch: Bool, model: String) async -> (text: String, searched: Bool, error: String?) {
+        func turn(webSearch: Bool, model: String) async -> (text: String, searched: Bool, emptyQuery: Bool, error: String?) {
             let config = ProviderConfig(baseURL: "", apiKey: "", model: model, kind: .codexAppServer)
             let history = [OpenAIChatClient.WireMessage(
                 role: "user",
@@ -289,6 +289,7 @@ if CommandLine.arguments.contains("--smoke-codex-app-server-search") {
             )]
             var text = ""
             var searched = false
+            var emptyQuery = false
             var failure: String?
             for await event in CodexAppServerClient.run(
                 history: history, config: config, webSearch: webSearch, inactivityTimeout: 120
@@ -296,12 +297,17 @@ if CommandLine.arguments.contains("--smoke-codex-app-server-search") {
                 switch event {
                 case .partial(let value), .done(let value): text = value
                 case .activity(let value):
-                    if value.contains("searched the web") { searched = true }
+                    if value.contains("searched the web") {
+                        searched = true
+                        // A row ending in a bare colon is the started-time
+                        // labeling bug: the begin event has no query.
+                        if value.trimmingCharacters(in: .whitespaces).hasSuffix(":") { emptyQuery = true }
+                    }
                 case .status: break
                 case .error(let value): failure = value
                 }
             }
-            return (text, searched, failure)
+            return (text, searched, emptyQuery, failure)
         }
 
         let model: String
@@ -314,14 +320,15 @@ if CommandLine.arguments.contains("--smoke-codex-app-server-search") {
         }
 
         let on = await turn(webSearch: true, model: model)
-        print("globe=on searched=\(on.searched) error=\(on.error ?? "none") text=\(on.text.prefix(120))")
+        print("globe=on searched=\(on.searched) emptyQuery=\(on.emptyQuery) error=\(on.error ?? "none") text=\(on.text.prefix(120))")
         let off = await turn(webSearch: false, model: model)
         print("globe=off searched=\(off.searched) error=\(off.error ?? "none") text=\(off.text.prefix(120))")
 
         // Search FIRING is model-discretionary, so the pass condition is the
         // config being accepted (no error, an answer arrives) plus the gate
         // holding: with the globe off the tool must not exist to be called.
-        let passed = on.error == nil && !on.text.isEmpty
+        // Any search row that DID fire must name its query.
+        let passed = on.error == nil && !on.text.isEmpty && !on.emptyQuery
             && off.error == nil && !off.text.isEmpty
             && !off.searched
         print(passed ? "PASS" : "FAIL")

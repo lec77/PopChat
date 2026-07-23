@@ -491,14 +491,23 @@ enum CodexAppServerClient {
                 case "item/started":
                     if let activity = activityLabel(item: params["item"]?.objectValue) {
                         continuation.yield(.activity(activity))
-                    } else if params["item"]?.objectValue?["type"]?.stringValue == "reasoning" {
-                        // Reasoning items stream no visible text but can run for
-                        // a long time — the one signal that the model is alive.
-                        continuation.yield(.status("Reasoning…"))
+                    } else {
+                        switch params["item"]?.objectValue?["type"]?.stringValue {
+                        case "reasoning":
+                            // Reasoning items stream no visible text but can run
+                            // for a long time — the one signal that the model is
+                            // alive.
+                            continuation.yield(.status("Reasoning…"))
+                        case "webSearch":
+                            continuation.yield(.status("Searching the web…"))
+                        default:
+                            break
+                        }
                     }
                 case "item/completed":
-                    if let item = params["item"]?.objectValue,
-                       item["type"]?.stringValue == "agentMessage" {
+                    guard let item = params["item"]?.objectValue else { continue }
+                    switch item["type"]?.stringValue {
+                    case "agentMessage":
                         // The completed item's own text wins over the deltas we
                         // reassembled for it; fall back to those if it carries none.
                         let text = item["text"]?.stringValue ?? ""
@@ -506,6 +515,10 @@ enum CodexAppServerClient {
                         streamingItem = ""
                         if !settled.isEmpty { completedItems.append(settled) }
                         continuation.yield(.partial(snapshot()))
+                    case "webSearch":
+                        continuation.yield(.activity(webSearchLabel(item)))
+                    default:
+                        break
                     }
                 case "error":
                     let willRetry = params["willRetry"]?.boolValue ?? false
@@ -672,11 +685,20 @@ enum CodexAppServerClient {
         return input
     }
 
+    /// The transcript row for a web search, labeled from `item/completed` ONLY:
+    /// the protocol's begin event carries just a call id — the query arrives
+    /// with the end event — so labeling at `item/started` printed a bare
+    /// "searched the web:" with nothing after the colon.
+    private static func webSearchLabel(_ item: JSONObject) -> String {
+        let query = (item["query"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return query.isEmpty
+            ? "Codex app-server searched the web."
+            : "Codex app-server searched the web: \(query)"
+    }
+
     private static func activityLabel(item: JSONObject?) -> String? {
         guard let item, let type = item["type"]?.stringValue else { return nil }
         switch type {
-        case "webSearch":
-            return "Codex app-server searched the web: \(item["query"]?.stringValue ?? "")"
         case "commandExecution":
             return "⚠︎ Codex app-server attempted a local command; PopChat's read-only, no-approval policy applies."
         case "fileChange":

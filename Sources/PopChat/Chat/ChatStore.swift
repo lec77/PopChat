@@ -219,7 +219,6 @@ final class ChatStore: ObservableObject {
         // fallback warning) for a provider that cannot consume it — the globe
         // instead switches Codex's NATIVE web_search on at launch.
         let codexWebSearch = config.kind == .codexAppServer && Self.webSearchEnabled
-        if codexWebSearch { noteCodexNativeSearch() }
         let webAccess = config.kind == .codexAppServer
             ? nil
             : resolveWebAccess(providerBaseURL: config.baseURL)
@@ -514,18 +513,6 @@ final class ChatStore: ObservableObject {
             return .text(combined)
         }
         return .parts(imageParts + [.text(combined.isEmpty ? "See attached image(s)." : combined)])
-    }
-
-    private static let codexNativeSearchNotice =
-        "Codex runs its own web search — the Search engine setting doesn't apply to this provider."
-
-    /// Codex's native `web_search` ignores the Settings engine choice and
-    /// PopChat's round cap, which the policy says to state rather than degrade
-    /// silently. Once per conversation, though: unlike the per-message
-    /// fallbacks this is a standing property of the provider, not of the turn.
-    private func noteCodexNativeSearch() {
-        guard !messages.contains(where: { $0.text == Self.codexNativeSearchNotice }) else { return }
-        messages.append(ChatMessage(role: .activity, text: Self.codexNativeSearchNotice))
     }
 
     /// Resolves the Settings search-engine choice against the active provider,

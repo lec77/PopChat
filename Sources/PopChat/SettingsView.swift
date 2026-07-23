@@ -739,7 +739,12 @@ struct SettingsView: View {
         .foregroundStyle(.secondary)
         .fixedSize(horizontal: false, vertical: true)
 
-        Text("Chat-only safety: PopChat requests ephemeral read-only threads with approval policy Never, and launches Codex with shell/exec, MCP, plugins/connectors, web search, subagents, and other machine tools disabled. The Web Search settings in PopChat do not apply to this provider. Managed Codex policy may override client settings, so app-server remains a local process you should trust and maintain.")
+        Text("Chat-only safety: PopChat requests ephemeral read-only threads with approval policy Never, and launches Codex with shell/exec, MCP, plugins/connectors, subagents, and other machine tools disabled. Managed Codex policy may override client settings, so app-server remains a local process you should trust and maintain.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+
+        Text("Web search: Codex runs its own web search, switched by the globe in the chat input. The engine choice and round cap in Settings → Web Search don't apply to this provider.")
             .font(.caption)
             .foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
