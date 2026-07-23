@@ -76,6 +76,30 @@ final class ChatStore: ObservableObject {
     }
     @Published private(set) var reveal: RevealState?
 
+    /// Set when a send that carried image/file parts failed WITHOUT a structural
+    /// attribution: the matching error row offers "don't send X to this model
+    /// again" so manual exceptions are added where the problem appeared, not in
+    /// Settings. Session-only — it names a specific rendered row.
+    struct CapabilityFailureContext: Equatable {
+        var errorMessageID: UUID
+        var providerID: UUID
+        var model: String
+        var sentImages: Bool
+        var sentFiles: Bool
+    }
+    @Published private(set) var capabilityFailure: CapabilityFailureContext?
+
+    /// The error-row action: records the user's own diagnosis as a manual
+    /// exception for the provider+model that just failed.
+    func recordManualCapabilityException(_ capability: ContentCapability) {
+        guard let context = capabilityFailure else { return }
+        providerStore.recordCapabilityException(
+            capability, supported: false, source: .manual,
+            providerID: context.providerID, model: context.model
+        )
+        capabilityFailure = nil
+    }
+
     init(providerStore: ProviderStore, shortcutStore: ShortcutStore) {
         self.providerStore = providerStore
         self.shortcutStore = shortcutStore
@@ -223,12 +247,29 @@ final class ChatStore: ObservableObject {
             ? nil
             : resolveWebAccess(providerBaseURL: config.baseURL)
 
+        // Capability is resolved at SEND time against the live provider+model —
+        // attachments load at drop time and the user can switch in between.
+        let sendProviderID = providerStore.selectedID
+        let capabilities = providerStore.attachmentCapabilities(for: sendProviderID, model: config.model)
+        capabilityFailure = nil
+
         var history = messages
             .filter { $0.role == .user || $0.role == .assistant }
-            .map { OpenAIChatClient.WireMessage(role: $0.role.rawValue, content: Self.wireContent(for: $0)) }
+            .map { OpenAIChatClient.WireMessage(role: $0.role.rawValue, content: Self.wireContent(for: $0, capabilities: capabilities)) }
         let systemPrompt = Self.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         if !systemPrompt.isEmpty {
             history.insert(OpenAIChatClient.WireMessage(role: "system", content: .text(systemPrompt)), at: 0)
+        }
+        // What this request actually carries, for the unattributed-failure action
+        // ("don't send images to this model again") on the error row.
+        var sentImages = false
+        var sentFiles = false
+        for message in history {
+            guard case .parts(let parts) = message.content else { continue }
+            for part in parts {
+                if part.type == "image_url" { sentImages = true }
+                if part.type == "file" { sentFiles = true }
+            }
         }
 
         persist()
@@ -273,7 +314,26 @@ final class ChatStore: ObservableObject {
                     messages.insert(ChatMessage(role: .activity, text: text), at: assistantIndex)
                     assistantIndex += 1
                 case .error(let message):
-                    messages.append(ChatMessage(role: .error, text: message))
+                    let row = ChatMessage(role: .error, text: message)
+                    messages.append(row)
+                    // The rejection wasn't attributable, but the request carried
+                    // typed parts — offer the manual exception on this row.
+                    if sentImages || sentFiles {
+                        capabilityFailure = CapabilityFailureContext(
+                            errorMessageID: row.id, providerID: sendProviderID,
+                            model: config.model, sentImages: sentImages, sentFiles: sentFiles
+                        )
+                    }
+                case .contentRejected(let capability, let message):
+                    providerStore.recordCapabilityException(
+                        capability, supported: false, source: .learned,
+                        providerID: sendProviderID, model: config.model
+                    )
+                    let noun = capability == .images ? "images" : "PDF files"
+                    messages.append(ChatMessage(
+                        role: .error,
+                        text: "\(message)\n\nRecorded: \(config.model) didn't accept \(noun) — the composer will warn before sending it \(noun) again. Clear this in Settings → Providers if the rejection was transient."
+                    ))
                 }
             }
             let finalText = streamTarget
@@ -491,28 +551,46 @@ final class ChatStore: ObservableObject {
         return pending.first { paragraphEnds.contains($0) && $0 < candidate } ?? candidate
     }
 
-    /// Inlines text attachments ahead of the typed text; images become content parts.
-    /// Stays a bare string when there are no images, for maximum provider compatibility.
-    private static func wireContent(for message: ChatMessage) -> OpenAIChatClient.WireContent {
+    /// Inlines text attachments ahead of the typed text; images become content
+    /// parts. Stays a bare string when there are no typed parts, for maximum
+    /// provider compatibility. Capability-aware and re-decided EVERY send: images
+    /// are ALWAYS sent (PopChat does no image→text conversion — a known-refusing
+    /// model warns in the composer instead), and a PDF goes as the original file
+    /// exactly when the provider+model resolved to `files == true`, else as its
+    /// extracted text. Non-private (and nonisolated — it's pure) for the
+    /// attach-caps harness.
+    nonisolated static func wireContent(
+        for message: ChatMessage, capabilities: AttachmentCapabilities
+    ) -> OpenAIChatClient.WireContent {
         let base = message.wireText ?? message.text
         var textBlocks: [String] = []
-        var imageParts: [OpenAIChatClient.WirePart] = []
+        var typedParts: [OpenAIChatClient.WirePart] = []
         for attachment in message.attachments {
+            // Only real warnings travel to the model (it should know data is partial);
+            // routine processing notes are user-facing only.
+            let suffix = (attachment.noteKind == .warning ? attachment.note : nil).map { " — \($0)" } ?? ""
             switch attachment.content {
             case .text(let text):
-                // Only real warnings travel to the model (it should know data is partial);
-                // routine processing notes are user-facing only.
-                let suffix = (attachment.noteKind == .warning ? attachment.note : nil).map { " — \($0)" } ?? ""
                 textBlocks.append("[File: \(attachment.filename)\(suffix)]\n\(text)")
             case .image(let dataURL):
-                imageParts.append(.imageDataURL(dataURL))
+                typedParts.append(.imageDataURL(dataURL))
+            case .pdf(let dataURL, let extractedText):
+                if capabilities.files == true {
+                    typedParts.append(.fileDataURL(filename: attachment.filename, dataURL: dataURL))
+                } else if !extractedText.isEmpty {
+                    textBlocks.append("[File: \(attachment.filename)\(suffix)]\n\(extractedText)")
+                } else {
+                    // Never silent: a scanned PDF on a text-only path states its
+                    // absence instead of contributing an empty block.
+                    textBlocks.append("[File: \(attachment.filename) — a PDF with no extractable text; its content could not be included because this model does not accept PDF files directly]")
+                }
             }
         }
         let combined = (textBlocks + [base]).filter { !$0.isEmpty }.joined(separator: "\n\n")
-        if imageParts.isEmpty {
+        if typedParts.isEmpty {
             return .text(combined)
         }
-        return .parts(imageParts + [.text(combined.isEmpty ? "See attached image(s)." : combined)])
+        return .parts(typedParts + [.text(combined.isEmpty ? "See the attached file(s)." : combined)])
     }
 
     /// Resolves the Settings search-engine choice against the active provider,

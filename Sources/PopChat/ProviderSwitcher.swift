@@ -244,6 +244,10 @@ struct ProviderSwitcher: View {
     private func modelRow(_ model: String, index: Int) -> some View {
         let isCurrent = model == store.rememberedModel(previewID)
         let isFocused = column == .models && index == modelIndex
+        // Capability glyphs at the decision point: photo = accepts images,
+        // paperclip = takes PDFs directly. Known-true only — unknown shows
+        // nothing rather than implying an answer nobody has.
+        let capabilities = store.attachmentCapabilities(for: previewID, model: model)
         return Button {
             commitModel(model)
         } label: {
@@ -253,6 +257,18 @@ struct ProviderSwitcher: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer(minLength: 4)
+                if capabilities.images == true {
+                    Image(systemName: "photo")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                        .help("Accepts images")
+                }
+                if capabilities.files == true {
+                    Image(systemName: "paperclip")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                        .help("Takes PDF files directly")
+                }
                 if isCurrent {
                     Image(systemName: "checkmark")
                         .font(.system(size: 10, weight: .semibold))

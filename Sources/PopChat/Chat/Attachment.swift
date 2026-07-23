@@ -9,6 +9,14 @@ struct Attachment: Identifiable, Equatable, Codable {
     enum Content: Equatable, Codable {
         case text(String)
         case image(dataURL: String)
+        /// A PDF keeps BOTH forms: capability is a property of the provider+model
+        /// picked at SEND time (the user can switch after dropping the file), so
+        /// the choice between the raw bytes and the extracted text has to wait
+        /// until `ChatStore.wireContent`. Raw retention is capped
+        /// (`AttachmentLoader.maxDirectPDFBytes`) so conversation JSON can't
+        /// balloon to the 25 MB file limit; over the cap it degrades to `.text`
+        /// with a visible note.
+        case pdf(dataURL: String, extractedText: String)
     }
 
     enum NoteKind: Equatable, Codable {
@@ -38,6 +46,9 @@ enum AttachmentLoader {
     static let maxRowsPerSheet = 200
     static let maxPDFPages = 100
     static let maxImageEdge = 2048.0
+    /// Raw-PDF retention cap for direct pass-through — parity with the image
+    /// cap, and the ceiling on what one attachment adds to a conversation file.
+    static let maxDirectPDFBytes = 10 * 1024 * 1024
 
     private static let imageExtensions: Set<String> = ["png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "tiff", "bmp"]
     private static let wordExtensions: Set<String> = ["docx", "doc", "rtf", "rtfd", "odt"]
@@ -143,23 +154,39 @@ enum AttachmentLoader {
             .joined(separator: "\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
+        // Small enough to keep the original alongside the extraction: a provider
+        // that accepts PDF input gets the real file at send time.
+        let raw = try? Data(contentsOf: url)
+        let keepsRaw = (raw?.count ?? .max) <= maxDirectPDFBytes
+
         var notes: [String] = []
         if pageCount > maxPDFPages {
-            notes.append("first \(maxPDFPages) of \(pageCount) pages")
+            notes.append("first \(maxPDFPages) of \(pageCount) pages when sent as text")
         }
         // Heuristic: a text PDF averages far more than 80 chars/page. Below that it's
         // likely scanned images — warn instead of silently sending near-empty text.
         if text.count < usedPages * 80 {
-            notes.append("very little extractable text — likely a scanned PDF; content may be missing")
+            notes.append(keepsRaw
+                ? "very little extractable text — likely scanned; needs a model that accepts PDFs directly"
+                : "very little extractable text — likely a scanned PDF; content may be missing")
         }
         if text.count > maxTextChars {
             text = String(text.prefix(maxTextChars))
-            notes.append("truncated at \(maxTextChars) characters")
+            notes.append("truncated at \(maxTextChars) characters when sent as text")
         }
-        if text.isEmpty {
-            throw AttachError(message: "\(filename): no extractable text (scanned PDF?). Attach page screenshots instead for vision models.")
+        if text.isEmpty, !keepsRaw {
+            throw AttachError(message: "\(filename): no extractable text (scanned PDF?), and too large to send as a PDF file. Attach page screenshots instead for vision models.")
         }
-        return Attachment(filename: filename, content: .text(text), note: notes.isEmpty ? nil : notes.joined(separator: "; "))
+        if let raw, keepsRaw {
+            let dataURL = "data:application/pdf;base64," + raw.base64EncodedString()
+            return Attachment(
+                filename: filename,
+                content: .pdf(dataURL: dataURL, extractedText: text),
+                note: notes.isEmpty ? nil : notes.joined(separator: "; ")
+            )
+        }
+        notes.append("over \(maxDirectPDFBytes / 1_048_576) MB — sent as extracted text, not the original PDF")
+        return Attachment(filename: filename, content: .text(text), note: notes.joined(separator: "; "))
     }
 
     // MARK: - Word / RTF

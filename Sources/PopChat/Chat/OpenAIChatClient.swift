@@ -30,6 +30,10 @@ enum ChatStreamEvent {
     case status(String)
     case done(String)
     case error(String)
+    /// An `.error` whose cause was attributed — via structured error fields
+    /// only, never message prose — to a content part kind the request carried.
+    /// ChatStore records the capability exception before showing the message.
+    case contentRejected(ContentCapability, message: String)
 }
 
 enum OpenAIChatClient {
@@ -71,21 +75,37 @@ enum OpenAIChatClient {
         struct ImageURL: Codable, Equatable {
             var url: String
         }
+        /// Native PDF input (OpenAI, OpenRouter): the original file as a base64
+        /// data URL, no upload round-trip.
+        struct FilePayload: Codable, Equatable {
+            var filename: String
+            var fileData: String
+
+            enum CodingKeys: String, CodingKey {
+                case filename
+                case fileData = "file_data"
+            }
+        }
         var type: String
         var text: String?
         var imageURL: ImageURL?
+        var file: FilePayload?
 
         enum CodingKeys: String, CodingKey {
-            case type, text
+            case type, text, file
             case imageURL = "image_url"
         }
 
         static func text(_ string: String) -> WirePart {
-            WirePart(type: "text", text: string, imageURL: nil)
+            WirePart(type: "text", text: string, imageURL: nil, file: nil)
         }
 
         static func imageDataURL(_ url: String) -> WirePart {
-            WirePart(type: "image_url", text: nil, imageURL: ImageURL(url: url))
+            WirePart(type: "image_url", text: nil, imageURL: ImageURL(url: url), file: nil)
+        }
+
+        static func fileDataURL(filename: String, dataURL: String) -> WirePart {
+            WirePart(type: "file", text: nil, imageURL: nil, file: FilePayload(filename: filename, fileData: dataURL))
         }
     }
 
@@ -202,7 +222,11 @@ enum OpenAIChatClient {
             } catch is CancellationError {
                 return // user hit stop; store keeps the partial
             } catch let error as ClientError {
-                continuation.yield(.error(error.message))
+                if let rejection = error.contentRejection {
+                    continuation.yield(.contentRejected(rejection, message: error.message))
+                } else {
+                    continuation.yield(.error(error.message))
+                }
                 return
             } catch {
                 continuation.yield(.error(error.localizedDescription))
@@ -246,6 +270,8 @@ enum OpenAIChatClient {
 
     private struct ClientError: Error {
         let message: String
+        /// Set when the failure was structurally attributed to a content kind.
+        var contentRejection: ContentCapability? = nil
     }
 
     private struct StreamChunk: Decodable {
@@ -327,7 +353,12 @@ enum OpenAIChatClient {
                 errorBody += line
                 if errorBody.count > 2000 { break }
             }
-            throw ClientError(message: "HTTP \(http.statusCode) from \(url.host() ?? "?"): \(errorBody.isEmpty ? "no body" : errorBody)")
+            throw ClientError(
+                message: "HTTP \(http.statusCode) from \(url.host() ?? "?"): \(errorBody.isEmpty ? "no body" : errorBody)",
+                contentRejection: attributeContentRejection(
+                    statusCode: http.statusCode, errorBody: errorBody, messages: messages
+                )
+            )
         }
 
         var visible = visiblePrefix
@@ -363,5 +394,65 @@ enum OpenAIChatClient {
             WireToolCall(id: call.id, function: .init(name: call.name, arguments: call.arguments))
         }
         return RoundOutcome(visibleText: visible, roundText: roundText, toolCalls: toolCalls)
+    }
+
+    // MARK: - Capability attribution
+
+    /// Matches an `error.param` JSON path like "messages.[1].content.[0].type"
+    /// or "messages[1].content[0]" — the two indices are what let us look up the
+    /// part TYPE we actually sent at that position.
+    private static let paramPathRegex = try! NSRegularExpression(
+        pattern: #"messages\D{0,3}(\d+)\D{0,3}content\D{0,3}(\d+)"#
+    )
+
+    /// Decides whether a failed request was rejected BECAUSE of a content part
+    /// kind it carried. Structured fields only (`error.param` — a machine JSON
+    /// path): message prose is never substring-matched, the same law as the
+    /// Codex app-server's typed-reason mapping. Unattributable failures return
+    /// nil — the caller shows the error and learns nothing.
+    static func attributeContentRejection(
+        statusCode: Int, errorBody: String, messages: [WireMessage]
+    ) -> ContentCapability? {
+        guard statusCode == 400 || statusCode == 415 || statusCode == 422 else { return nil }
+        // Attribution is meaningless unless the request actually carried the kind.
+        var sent: Set<ContentCapability> = []
+        for message in messages {
+            guard case .parts(let parts) = message.content else { continue }
+            for part in parts {
+                if part.type == "image_url" { sent.insert(.images) }
+                if part.type == "file" { sent.insert(.files) }
+            }
+        }
+        guard !sent.isEmpty,
+              let data = errorBody.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        let error = root["error"] as? [String: Any] ?? root
+        guard let param = error["param"] as? String, !param.isEmpty else { return nil }
+
+        func capability(forPartType type: String) -> ContentCapability? {
+            switch type {
+            case "image_url": return sent.contains(.images) ? .images : nil
+            case "file": return sent.contains(.files) ? .files : nil
+            default: return nil
+            }
+        }
+
+        // Strongest signal: the param names the exact part index — resolve what
+        // WE sent there rather than trusting any wording.
+        let range = NSRange(param.startIndex..., in: param)
+        if let match = paramPathRegex.firstMatch(in: param, range: range),
+           let messageRange = Range(match.range(at: 1), in: param),
+           let partRange = Range(match.range(at: 2), in: param),
+           let messageIndex = Int(param[messageRange]),
+           let partIndex = Int(param[partRange]),
+           messages.indices.contains(messageIndex),
+           case .parts(let parts) = messages[messageIndex].content,
+           parts.indices.contains(partIndex) {
+            return capability(forPartType: parts[partIndex].type)
+        }
+        // Weaker but still structural: the path names the field itself.
+        if param.contains("image_url") { return sent.contains(.images) ? .images : nil }
+        if param.contains("file_data") || param == "file" { return sent.contains(.files) ? .files : nil }
+        return nil
     }
 }

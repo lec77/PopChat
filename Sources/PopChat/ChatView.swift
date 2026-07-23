@@ -127,6 +127,7 @@ struct ChatView: View {
             }
             ComposerView(
                 model: composerModel,
+                providerStore: providerStore,
                 shortcutStore: shortcutStore,
                 isStreaming: store.isStreaming,
                 focusBump: state.focusBump,
@@ -310,6 +311,16 @@ struct ChatView: View {
                             let waiting: String? = id == streamingID && message.text.isEmpty
                                 ? (store.pendingStatus ?? "Thinking…")
                                 : nil
+                            // Nil for every row but the one unattributed-failure
+                            // error row (same gating trick again).
+                            let capabilityAction: MessageRow.CapabilityAction? =
+                                store.capabilityFailure?.errorMessageID == id
+                                    ? store.capabilityFailure.map {
+                                        MessageRow.CapabilityAction(
+                                            model: $0.model, images: $0.sentImages, files: $0.sentFiles
+                                        )
+                                    }
+                                    : nil
                             MessageRow(
                                 message: message,
                                 // The caret rides the fade head (Delta 4), so it
@@ -320,8 +331,10 @@ struct ChatView: View {
                                 find: rowFind,
                                 reveal: revealing ? revealFade : nil,
                                 waitingStatus: waiting,
+                                capabilityAction: capabilityAction,
                                 onFork: { store.fork(at: id) },
-                                fullText: { store.fullText(of: id) }
+                                fullText: { store.fullText(of: id) },
+                                onRecordException: { store.recordManualCapabilityException($0) }
                             )
                             .equatable()
                             .transition(rowTransition(for: message.role))
@@ -658,12 +671,23 @@ private struct MessageRow: View, Equatable {
     /// waiting indicator pulses ("Thinking…", or the provider's latest `.status`).
     /// Part of == so a status change repaints exactly this row.
     var waitingStatus: String?
+    /// Non-nil only for the error row of an unattributed send failure that
+    /// carried image/file parts: the "don't send X to this model again" manual
+    /// exception, offered where the problem appeared. Part of ==.
+    struct CapabilityAction: Equatable {
+        var model: String
+        var images: Bool
+        var files: Bool
+    }
+    var capabilityAction: CapabilityAction?
     /// Ignored by ==: it captures only stable references (store + message id).
     var onFork: () -> Void = {}
     /// Likewise ignored by ==. Resolves at click time to the text that has
     /// ARRIVED, which differs from `message.text` while the typewriter is still
     /// revealing this row — Copy promises the whole response.
     var fullText: () -> String = { "" }
+    /// Likewise ignored by ==.
+    var onRecordException: (ContentCapability) -> Void = { _ in }
 
     @AppStorage("bubbleStyle") private var bubbleStyleRaw = BubbleStyle.accentTint.rawValue
     @AppStorage("accentColor") private var accentHex = Theme.defaultAccentHex
@@ -682,6 +706,7 @@ private struct MessageRow: View, Equatable {
             && lhs.find == rhs.find
             && lhs.reveal == rhs.reveal
             && lhs.waitingStatus == rhs.waitingStatus
+            && lhs.capabilityAction == rhs.capabilityAction
             && abs(lhs.bubbleMaxWidth - rhs.bubbleMaxWidth) < 0.5
     }
 
@@ -780,13 +805,41 @@ private struct MessageRow: View, Equatable {
                 .foregroundStyle(.primary.opacity(0.5))
                 .frame(maxWidth: .infinity, alignment: .leading)
         case .error:
-            Label { Text(FindHighlight.paint(message.text, find: textFind)) } icon: {
-                Image(systemName: "exclamationmark.triangle.fill")
+            VStack(alignment: .leading, spacing: 6) {
+                Label { Text(FindHighlight.paint(message.text, find: textFind)) } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                }
+                    .font(.callout)
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
+                if let action = capabilityAction {
+                    HStack(spacing: 12) {
+                        if action.images {
+                            Button {
+                                onRecordException(.images)
+                            } label: {
+                                Text("Don't send images to \(action.model) again")
+                                    .padding(.vertical, 4)
+                                    .contentShape(Rectangle())
+                            }
+                        }
+                        if action.files {
+                            Button {
+                                onRecordException(.files)
+                            } label: {
+                                Text("Don't send PDFs directly to \(action.model) again")
+                                    .padding(.vertical, 4)
+                                    .contentShape(Rectangle())
+                            }
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 22)
+                }
             }
-                .font(.callout)
-                .foregroundStyle(.red)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }

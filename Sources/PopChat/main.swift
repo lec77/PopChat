@@ -58,6 +58,9 @@ if smokePlain || smokeSearch || smokePasteable {
             case .error(let message):
                 print("ERROR: \(message)")
                 exit(1)
+            case .contentRejected(let capability, let message):
+                print("ERROR (\(capability.rawValue) rejected): \(message)")
+                exit(1)
             }
         }
         exit(1)
@@ -305,6 +308,7 @@ if CommandLine.arguments.contains("--smoke-codex-app-server-search") {
                     }
                 case .status: break
                 case .error(let value): failure = value
+                case .contentRejected(_, let value): failure = value
                 }
             }
             return (text, searched, emptyQuery, failure)
@@ -380,6 +384,8 @@ if let flag = CommandLine.arguments.firstIndex(of: "--smoke-codex-app-server-str
             case .activity:
                 break
             case .error(let message):
+                failure = message
+            case .contentRejected(_, let message):
                 failure = message
             }
         }
@@ -531,6 +537,9 @@ if CommandLine.arguments.contains("--smoke-chatgpt") {
             case .error(let message):
                 print("ERROR: \(message)")
                 exit(1)
+            case .contentRejected(let capability, let message):
+                print("ERROR (\(capability.rawValue) rejected): \(message)")
+                exit(1)
             }
         }
         exit(1)
@@ -594,6 +603,9 @@ if let flagIndex = CommandLine.arguments.firstIndex(of: "--smoke-file"),
                 print("preview: \(text.prefix(160).replacingOccurrences(of: "\n", with: "⏎"))")
             case .image(let dataURL):
                 print("OK image dataURLBytes=\(dataURL.count) note=\(attachment.note ?? "-")")
+            case .pdf(let dataURL, let extractedText):
+                print("OK pdf dataURLBytes=\(dataURL.count) textChars=\(extractedText.count) note=\(attachment.note ?? "-")")
+                print("preview: \(extractedText.prefix(160).replacingOccurrences(of: "\n", with: "⏎"))")
             }
         case .failure(let error):
             print("ATTACH-ERROR: \(error.message)")
@@ -1581,6 +1593,156 @@ if CommandLine.arguments.contains("--smoke-accent") {
     guard BubbleStyle(rawValue: "quietGray") ?? .accentTint == .accentTint else { fail("quietGray must fall back to accentTint") }
 
     print("OK: \(checked) HSB round trips, clamping, hex fallbacks, contrast and bubble-style migration")
+    exit(0)
+}
+
+// Attachment-capability laws (no GUI, no network, no defaults touched):
+//   .build/debug/PopChat --smoke-attach-caps
+//
+// The 2026-07-23 capability design in miniature: resolution priority (manual
+// exception > learned > authoritative metadata > kind default), images always
+// sent, PDFs passed through as files exactly when the resolved answer says so,
+// rejection attribution from STRUCTURED error fields only, manual exceptions
+// sticking over learned ones, and OpenRouter modality decoding.
+if CommandLine.arguments.contains("--smoke-attach-caps") {
+    func fail(_ message: String) -> Never {
+        print("FAIL: \(message)")
+        exit(1)
+    }
+
+    // 1. Resolution chain: each field independently walks exception > metadata >
+    //    default — an exception about images must not erase file metadata.
+    let chain = ProviderStore.resolveCapabilities(
+        exception: CapabilityException(images: false, files: nil, source: .learned),
+        metadata: ModelCapabilities(images: true, files: true),
+        kindDefault: AttachmentCapabilities(images: nil, files: false)
+    )
+    guard chain.images == false else { fail("exception must beat metadata for its own field") }
+    guard chain.files == true else { fail("an images exception erased file metadata") }
+    let bare = ProviderStore.resolveCapabilities(
+        exception: nil, metadata: nil,
+        kindDefault: AttachmentCapabilities(images: nil, files: false)
+    )
+    guard bare.images == nil, bare.files == false else { fail("kind default must answer when nothing else does") }
+
+    // 2. Kind defaults: OpenAI preset fully capable (its API has no metadata to
+    //    ask); custom endpoints optimistic on images and toggle-gated on files;
+    //    the two Codex routes vision-only.
+    let openAI = Provider(id: UUID(), name: "OpenAI", baseURL: "https://api.openai.com/v1", isPreset: true, defaultModel: "gpt-4o")
+    guard ProviderStore.kindDefaultCapabilities(for: openAI, pdfPassThrough: false) == AttachmentCapabilities(images: true, files: true) else {
+        fail("OpenAI preset must default to images+files")
+    }
+    let custom = Provider(id: UUID(), name: "Custom", baseURL: "https://example.com/v1", isPreset: false, defaultModel: "")
+    guard ProviderStore.kindDefaultCapabilities(for: custom, pdfPassThrough: false) == AttachmentCapabilities(images: nil, files: false),
+          ProviderStore.kindDefaultCapabilities(for: custom, pdfPassThrough: true) == AttachmentCapabilities(images: nil, files: true) else {
+        fail("custom endpoints must be images-unknown and files-per-toggle")
+    }
+    let chatGPT = Provider(id: UUID(), name: "sub", baseURL: "", isPreset: true, defaultModel: "", kind: .chatGPT)
+    guard ProviderStore.kindDefaultCapabilities(for: chatGPT, pdfPassThrough: true) == AttachmentCapabilities(images: true, files: false) else {
+        fail("subscription routes must be vision-only regardless of any toggle")
+    }
+
+    // 3. wireContent: a PDF becomes a native file part exactly when files ==
+    //    true, its extracted text otherwise — and images are ALWAYS sent, even
+    //    to a model recorded as refusing them (the warning lives in the
+    //    composer; silently dropping them is the one forbidden outcome).
+    let pdfMessage = ChatMessage(
+        role: .user, text: "read this",
+        attachments: [Attachment(
+            filename: "doc.pdf",
+            content: .pdf(dataURL: "data:application/pdf;base64,QUJD", extractedText: "extracted words"),
+            note: nil
+        )]
+    )
+    let asFile = ChatStore.wireContent(for: pdfMessage, capabilities: AttachmentCapabilities(images: nil, files: true))
+    guard case .parts(let fileParts) = asFile,
+          let filePart = fileParts.first(where: { $0.type == "file" }),
+          filePart.file?.filename == "doc.pdf",
+          filePart.file?.fileData == "data:application/pdf;base64,QUJD" else {
+        fail("files==true must send the original PDF as a file part")
+    }
+    if case .parts(let parts) = asFile, parts.contains(where: { $0.text?.contains("extracted words") == true }) {
+        fail("pass-through must not ALSO inline the extraction")
+    }
+    let asText = ChatStore.wireContent(for: pdfMessage, capabilities: AttachmentCapabilities(images: nil, files: false))
+    guard case .text(let inlined) = asText, inlined.contains("extracted words"), inlined.contains("doc.pdf") else {
+        fail("files==false must inline the extracted text")
+    }
+    let scanned = ChatMessage(
+        role: .user, text: "",
+        attachments: [Attachment(
+            filename: "scan.pdf",
+            content: .pdf(dataURL: "data:application/pdf;base64,QUJD", extractedText: ""),
+            note: nil
+        )]
+    )
+    guard case .text(let absence) = ChatStore.wireContent(for: scanned, capabilities: AttachmentCapabilities(images: nil, files: false)),
+          absence.contains("could not be included") else {
+        fail("a textless PDF on a text-only path must state its absence, not send an empty block")
+    }
+    let imageMessage = ChatMessage(
+        role: .user, text: "look",
+        attachments: [Attachment(filename: "shot.png", content: .image(dataURL: "data:image/jpeg;base64,QUJD"), note: nil)]
+    )
+    guard case .parts(let imageParts) = ChatStore.wireContent(for: imageMessage, capabilities: AttachmentCapabilities(images: false, files: false)),
+          imageParts.contains(where: { $0.type == "image_url" }) else {
+        fail("images must be sent even when the model is recorded as refusing them")
+    }
+
+    // 4. Attribution: structured fields only. A param path naming the exact part
+    //    index resolves against what WE sent there; prose alone learns nothing;
+    //    and nothing is ever attributed to a kind the request didn't carry.
+    let sentHistory: [OpenAIChatClient.WireMessage] = [
+        .init(role: "system", content: .text("prompt")),
+        .init(role: "user", content: .parts([
+            .imageDataURL("data:image/jpeg;base64,QUJD"),
+            .fileDataURL(filename: "doc.pdf", dataURL: "data:application/pdf;base64,QUJD"),
+            .text("hello"),
+        ])),
+    ]
+    let paramBody = #"{"error":{"message":"whatever prose","type":"invalid_request_error","param":"messages.[1].content.[0].type","code":null}}"#
+    guard OpenAIChatClient.attributeContentRejection(statusCode: 400, errorBody: paramBody, messages: sentHistory) == .images else {
+        fail("a param naming the image part's index must attribute to images")
+    }
+    let fileParamBody = #"{"error":{"message":"x","param":"messages[1].content[1]","code":null}}"#
+    guard OpenAIChatClient.attributeContentRejection(statusCode: 400, errorBody: fileParamBody, messages: sentHistory) == .files else {
+        fail("a param naming the file part's index must attribute to files")
+    }
+    let proseBody = #"{"error":{"message":"this model does not support image input","param":null,"code":"invalid_request_error"}}"#
+    guard OpenAIChatClient.attributeContentRejection(statusCode: 400, errorBody: proseBody, messages: sentHistory) == nil else {
+        fail("prose-only errors must not be attributed — message text is never matched")
+    }
+    let textOnly: [OpenAIChatClient.WireMessage] = [.init(role: "user", content: .text("hi"))]
+    guard OpenAIChatClient.attributeContentRejection(statusCode: 400, errorBody: paramBody, messages: textOnly) == nil else {
+        fail("a request without typed parts can never be attributed")
+    }
+    guard OpenAIChatClient.attributeContentRejection(statusCode: 500, errorBody: paramBody, messages: sentHistory) == nil else {
+        fail("server faults are not capability answers")
+    }
+
+    // 5. Exceptions merge per field, and manual is sticky: a later learned
+    //    record updates fields but never demotes the source back to learned.
+    let learned = ProviderStore.mergedException(nil, capability: .images, supported: false, source: .learned)
+    guard learned.images == false, learned.files == nil, learned.source == .learned else { fail("learned record malformed") }
+    let manual = ProviderStore.mergedException(learned, capability: .files, supported: false, source: .manual)
+    guard manual.images == false, manual.files == false, manual.source == .manual else { fail("manual must merge onto learned") }
+    let after = ProviderStore.mergedException(manual, capability: .images, supported: false, source: .learned)
+    guard after.source == .manual else { fail("a learned record must not demote a manual exception") }
+
+    // 6. OpenRouter modality decoding: capabilities exactly for entries that
+    //    state them — absence stays absence.
+    let fixture = #"{"data":[{"id":"vendor/vision-file","architecture":{"input_modalities":["text","image","file"]}},{"id":"vendor/text-only","architecture":{"input_modalities":["text"]}},{"id":"vendor/unstated"}]}"#
+    guard let (ids, capabilities) = try? ProviderStore.decodeModelList(Data(fixture.utf8)) else {
+        fail("model-list fixture failed to decode")
+    }
+    guard ids == ["vendor/text-only", "vendor/unstated", "vendor/vision-file"] else { fail("ids wrong: \(ids)") }
+    guard capabilities["vendor/vision-file"] == ModelCapabilities(images: true, files: true),
+          capabilities["vendor/text-only"] == ModelCapabilities(images: false, files: false),
+          capabilities["vendor/unstated"] == nil else {
+        fail("modality decoding wrong: \(capabilities)")
+    }
+
+    print("OK: resolution chain, kind defaults, wire forms, structured attribution, sticky manual exceptions, modality decoding")
     exit(0)
 }
 

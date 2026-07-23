@@ -68,8 +68,13 @@ final class ComposerModel: ObservableObject {
 
     private func updateSizeWarning() {
         let totalChars = pendingAttachments.reduce(0) { total, attachment in
-            if case .text(let text) = attachment.content { return total + text.count }
-            return total
+            switch attachment.content {
+            case .text(let text): return total + text.count
+            // Counted at its text size: that's what lands in context on the
+            // (default) extracted-text path, and a fair proxy either way.
+            case .pdf(_, let extractedText): return total + extractedText.count
+            case .image: return total
+            }
         }
         if totalChars > 50_000 {
             attachNotice = "Attachments total ~\(totalChars / 4 / 1000)k tokens — may exceed smaller models' context windows."
@@ -282,6 +287,9 @@ struct ComposerTextView: NSViewRepresentable {
 /// keystrokes invalidate only this subtree.
 struct ComposerView: View {
     @ObservedObject var model: ComposerModel
+    /// Observed for the capability warning: it must re-resolve when the switcher
+    /// commits a different provider/model while attachments are pending.
+    @ObservedObject var providerStore: ProviderStore
     let shortcutStore: ShortcutStore
     let isStreaming: Bool
     let focusBump: Int
@@ -628,10 +636,46 @@ struct ComposerView: View {
                     .help("Dismiss")
                 }
             }
+            // No dismiss here: this one is DERIVED (re-resolves live from the
+            // pending attachments + current model), so it clears itself when the
+            // attachment is removed or the model changes — an ✕ would just have
+            // it reappear on the next render.
+            if let notice = capabilityNotice {
+                Label(notice, systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 11))
+                    .foregroundStyle(scheme == .dark ? Theme.warningOrange : Theme.warningTextLight)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .glassCard(RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    /// The explicit-warning half of the capability design: images are ALWAYS
+    /// sent, so a model KNOWN to refuse them (metadata or a recorded exception)
+    /// must say so before the send, not after. Unknown stays silent — optimistic
+    /// send, and a rejection surfaces (and is learned) as an explicit error.
+    /// Separate from `model.attachNotice` so switching provider/model while
+    /// attachments are pending re-resolves it live.
+    private var capabilityNotice: String? {
+        guard !model.pendingAttachments.isEmpty else { return nil }
+        let capabilities = providerStore.currentAttachmentCapabilities()
+        let modelName = providerStore.currentModel
+        let hasImages = model.pendingAttachments.contains {
+            if case .image = $0.content { return true } else { return false }
+        }
+        if hasImages, capabilities.images == false {
+            return "\(modelName) doesn't accept images — pick another model, or this send will likely be rejected."
+        }
+        let hasTextlessPDF = model.pendingAttachments.contains {
+            if case .pdf(_, let extractedText) = $0.content { return extractedText.isEmpty } else { return false }
+        }
+        if hasTextlessPDF, capabilities.files != true {
+            return "A scanned PDF has no extractable text, and \(modelName) doesn't take PDF files directly — its content can't be sent."
+        }
+        return nil
     }
 
     private func attachViaPicker() {
@@ -723,6 +767,7 @@ private struct AttachmentChip: View {
 
     private var icon: String {
         if case .image = attachment.content { return "photo" }
+        if case .pdf = attachment.content { return "doc.richtext" }
         return "doc.text"
     }
 }

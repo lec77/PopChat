@@ -535,6 +535,9 @@ struct SettingsView: View {
                             store.setKey(newValue, for: provider.id)
                         }
                 }
+                if !provider.isPreset {
+                    pdfPassThroughRow(provider)
+                }
             }
             modelRow(for: provider)
             Text("Used when this provider is picked for the first time; after that the pill remembers your last model per provider.")
@@ -547,6 +550,7 @@ struct SettingsView: View {
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            capabilityRows(provider)
             if !provider.isPreset {
                 Button("Remove Provider…", role: .destructive) {
                     providerPendingDeletion = provider.id
@@ -563,6 +567,100 @@ struct SettingsView: View {
         .background(Color.primary.opacity(0.025))
         .overlay(alignment: .top) { Divider().opacity(0.7) }
         .overlay(alignment: .bottom) { Divider().opacity(0.7) }
+    }
+
+    /// Custom endpoints only: whether PDFs go over the wire as native `file`
+    /// content parts. Endpoint-level, not per-model — the question it answers is
+    /// "does this proxy forward file parts at all"; per-model refusals are
+    /// handled by the exceptions below.
+    private func pdfPassThroughRow(_ provider: Provider) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Send PDFs directly")
+                    .font(.system(size: 12.5))
+                Text("Sends the original PDF as a file content part instead of extracted text. Turn on only if this endpoint accepts file input — many proxies reject or strip it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            Toggle("", isOn: Binding(
+                get: { store.pdfPassThrough[provider.id] == true },
+                set: { store.pdfPassThrough[provider.id] = $0 ? true : nil }
+            ))
+            .labelsHidden()
+            .toggleStyle(.switch)
+            .controlSize(.small)
+        }
+    }
+
+    /// The exception-based half of the capability design: a static one-liner
+    /// saying where this provider's answers come from, plus ONLY the models with
+    /// recorded deviations — never a table of the whole catalog.
+    @ViewBuilder
+    private func capabilityRows(_ provider: Provider) -> some View {
+        Text(capabilityNotice(provider))
+            .font(.system(size: 11))
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        let exceptions = (store.capabilityExceptions[provider.id] ?? [:]).sorted { $0.key < $1.key }
+        if !exceptions.isEmpty {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Attachment exceptions")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                ForEach(exceptions, id: \.key) { model, exception in
+                    HStack(spacing: 6) {
+                        Text(model)
+                            .font(.system(size: 12))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Text(Self.exceptionLabel(exception))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer(minLength: 8)
+                        Button {
+                            store.clearCapabilityException(providerID: provider.id, model: model)
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                                .frame(width: 18, height: 18)
+                                .contentShape(Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .help("Clear — PopChat will try again on the next send")
+                    }
+                }
+            }
+            .padding(.top, 2)
+        }
+    }
+
+    private func capabilityNotice(_ provider: Provider) -> String {
+        switch provider.kind {
+        case .chatGPT, .codexAppServer:
+            return "Images are sent to the model; PDFs go as extracted text (this route has no file upload)."
+        case .openAICompatible:
+            if provider.isPreset, provider.baseURL.contains("api.openai.com") {
+                return "Images and PDFs are sent to the model directly; one that rejects them shows an explicit error."
+            }
+            if provider.isPreset, provider.baseURL.contains("openrouter.ai") {
+                return "Image and PDF support is detected per model from OpenRouter's catalog."
+            }
+            if provider.isPreset {
+                return "Image support is detected per model from Ollama; PDFs are sent as extracted text."
+            }
+            return "Images are sent optimistically — a model that rejects them shows an explicit error and is remembered below."
+        }
+    }
+
+    private static func exceptionLabel(_ exception: CapabilityException) -> String {
+        var refusals: [String] = []
+        if exception.images == false { refusals.append("no images") }
+        if exception.files == false { refusals.append("no direct PDFs") }
+        let source = exception.source == .learned ? "recorded" : "manual"
+        return "\(refusals.joined(separator: ", ")) · \(source)"
     }
 
     /// Label left, 230pt field right — the Form's own label/value row can't be

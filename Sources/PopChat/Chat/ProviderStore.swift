@@ -49,6 +49,40 @@ struct Provider: Identifiable, Codable, Equatable {
     }
 }
 
+/// The two attachment content kinds whose provider support varies by model.
+enum ContentCapability: String, Codable {
+    case images
+    case files
+}
+
+/// Authoritative per-model capability metadata — only ever written from a source
+/// that actually states it (OpenRouter `input_modalities`, Ollama `/api/show`).
+/// A nil field means the source didn't say, never a guess.
+struct ModelCapabilities: Codable, Equatable {
+    var images: Bool?
+    var files: Bool?
+}
+
+/// A per-model deviation from the resolved default — learned from a provider
+/// rejection or set by the user. Settings lists exactly these, O(exceptions),
+/// never the full catalog.
+struct CapabilityException: Codable, Equatable {
+    enum Source: String, Codable {
+        case learned
+        case manual
+    }
+    var images: Bool?
+    var files: Bool?
+    var source: Source
+}
+
+/// What the send path acts on for one provider+model. nil = unknown: send
+/// optimistically and let a rejection surface (and be learned) explicitly.
+struct AttachmentCapabilities: Equatable {
+    var images: Bool?
+    var files: Bool?
+}
+
 @MainActor
 final class ProviderStore: ObservableObject {
     @Published var providers: [Provider] { didSet { persistJSON(providers, key: Keys.providers) } }
@@ -68,6 +102,22 @@ final class ProviderStore: ObservableObject {
     /// User choice is remembered independently for every provider/model pair.
     @Published var selectedModelEfforts: [UUID: [String: String]] {
         didSet { persistJSON(selectedModelEfforts, key: Keys.selectedModelEfforts) }
+    }
+    /// Attachment capabilities, per provider + model (same law as efforts:
+    /// authoritative sources only, never model-name guessing).
+    @Published var modelCapabilities: [UUID: [String: ModelCapabilities]] {
+        didSet { persistJSON(modelCapabilities, key: Keys.modelCapabilities) }
+    }
+    /// Learned/manual deviations — the only per-model capability state a user
+    /// ever sees or edits (Settings renders exactly this dictionary).
+    @Published var capabilityExceptions: [UUID: [String: CapabilityException]] {
+        didSet { persistJSON(capabilityExceptions, key: Keys.capabilityExceptions) }
+    }
+    /// Custom endpoints only: send PDFs as native `file` content parts. This is
+    /// endpoint-level on purpose — whether a proxy forwards an unknown part type
+    /// is a property of the endpoint, not of any model behind it.
+    @Published var pdfPassThrough: [UUID: Bool] {
+        didSet { persistJSON(pdfPassThrough, key: Keys.pdfPassThrough) }
     }
     /// Per-provider, not global: delta 5 renders fetch errors next to the provider
     /// they belong to — inline in the switcher's model column and in the expanded
@@ -107,6 +157,9 @@ final class ProviderStore: ObservableObject {
         static let knownModelEfforts = "knownModelEffortsJSON"
         static let defaultModelEfforts = "defaultModelEffortsJSON"
         static let selectedModelEfforts = "selectedModelEffortsJSON"
+        static let modelCapabilities = "modelCapabilitiesJSON"
+        static let capabilityExceptions = "capabilityExceptionsJSON"
+        static let pdfPassThrough = "pdfPassThroughJSON"
     }
 
     init() {
@@ -200,6 +253,9 @@ final class ProviderStore: ObservableObject {
         self.knownModelEfforts = knownModelEfforts
         self.defaultModelEfforts = defaultModelEfforts
         self.selectedModelEfforts = selectedModelEfforts
+        self.modelCapabilities = Self.loadJSON([UUID: [String: ModelCapabilities]].self, key: Keys.modelCapabilities) ?? [:]
+        self.capabilityExceptions = Self.loadJSON([UUID: [String: CapabilityException]].self, key: Keys.capabilityExceptions) ?? [:]
+        self.pdfPassThrough = Self.loadJSON([UUID: Bool].self, key: Keys.pdfPassThrough) ?? [:]
         // Fresh install (no stored selection): don't pretend the first preset is
         // usable — `migrated[0]` is the ChatGPT-subscription preset, which nobody
         // has signed into yet, and the pill would confidently name a provider
@@ -405,6 +461,98 @@ final class ProviderStore: ObservableObject {
         knownModelEfforts[id]?.values.contains(where: { !$0.isEmpty }) == true
     }
 
+    // MARK: - Attachment capabilities
+
+    /// The one answer the send path, the composer warning and the switcher
+    /// glyphs all read. Priority: manual/learned exception > authoritative
+    /// metadata > kind default — resolved per FIELD, so an exception recording
+    /// "no images" doesn't erase what metadata says about files.
+    func attachmentCapabilities(for id: UUID, model: String) -> AttachmentCapabilities {
+        guard let provider = providers.first(where: { $0.id == id }) else {
+            return AttachmentCapabilities()
+        }
+        return Self.resolveCapabilities(
+            exception: capabilityExceptions[id]?[model],
+            metadata: modelCapabilities[id]?[model],
+            kindDefault: Self.kindDefaultCapabilities(for: provider, pdfPassThrough: pdfPassThrough[id] == true)
+        )
+    }
+
+    func currentAttachmentCapabilities() -> AttachmentCapabilities {
+        attachmentCapabilities(for: selectedID, model: currentModel)
+    }
+
+    nonisolated static func resolveCapabilities(
+        exception: CapabilityException?,
+        metadata: ModelCapabilities?,
+        kindDefault: AttachmentCapabilities
+    ) -> AttachmentCapabilities {
+        AttachmentCapabilities(
+            images: exception?.images ?? metadata?.images ?? kindDefault.images,
+            files: exception?.files ?? metadata?.files ?? kindDefault.files
+        )
+    }
+
+    /// What a provider kind promises when nothing model-specific is known.
+    /// The OpenAI preset defaults to fully capable — its API exposes no
+    /// capability metadata at all, so the alternative is a rotting allowlist;
+    /// a model that disagrees rejects explicitly and gets learned. Everything
+    /// else OpenAI-compatible stays unknown for images (send optimistically)
+    /// and off for direct PDFs unless the endpoint's toggle says otherwise.
+    nonisolated static func kindDefaultCapabilities(for provider: Provider, pdfPassThrough: Bool) -> AttachmentCapabilities {
+        switch provider.kind {
+        case .chatGPT, .codexAppServer:
+            // Fixed catalogs, all gpt-5 family: vision yes; neither path has a
+            // file-upload channel, so PDFs stay locally extracted.
+            return AttachmentCapabilities(images: true, files: false)
+        case .openAICompatible:
+            if provider.isPreset, provider.baseURL.contains("api.openai.com") {
+                return AttachmentCapabilities(images: true, files: true)
+            }
+            return AttachmentCapabilities(images: nil, files: !provider.isPreset && pdfPassThrough)
+        }
+    }
+
+    /// Records that this provider+model refused a content kind. `learned` comes
+    /// from a structurally attributed rejection; `manual` from an explicit user
+    /// action — and manual never downgrades back to learned.
+    func recordCapabilityException(
+        _ capability: ContentCapability,
+        supported: Bool,
+        source: CapabilityException.Source,
+        providerID: UUID,
+        model: String
+    ) {
+        var forProvider = capabilityExceptions[providerID] ?? [:]
+        forProvider[model] = Self.mergedException(
+            forProvider[model], capability: capability, supported: supported, source: source
+        )
+        capabilityExceptions[providerID] = forProvider
+    }
+
+    nonisolated static func mergedException(
+        _ existing: CapabilityException?,
+        capability: ContentCapability,
+        supported: Bool,
+        source: CapabilityException.Source
+    ) -> CapabilityException {
+        var entry = existing ?? CapabilityException(source: source)
+        switch capability {
+        case .images: entry.images = supported
+        case .files: entry.files = supported
+        }
+        entry.source = existing?.source == .manual ? .manual : source
+        return entry
+    }
+
+    /// The ✕ in Settings: clear back to the default and simply try again on the
+    /// next send — no confirmation, because that retry is the whole cost.
+    func clearCapabilityException(providerID: UUID, model: String) {
+        var forProvider = capabilityExceptions[providerID] ?? [:]
+        forProvider[model] = nil
+        capabilityExceptions[providerID] = forProvider.isEmpty ? nil : forProvider
+    }
+
     /// Provider + model committed together — the switcher's unit of choice, and
     /// the only place selection is written now that Settings is a pure catalog.
     func select(_ id: UUID, model: String, effort: String? = nil) {
@@ -593,6 +741,9 @@ final class ProviderStore: ObservableObject {
         knownModelEfforts[id] = nil
         defaultModelEfforts[id] = nil
         selectedModelEfforts[id] = nil
+        modelCapabilities[id] = nil
+        capabilityExceptions[id] = nil
+        pdfPassThrough[id] = nil
         modelFetchErrors[id] = nil
         autoFetched.remove(id)
         providers.remove(at: index)
@@ -604,8 +755,35 @@ final class ProviderStore: ObservableObject {
     // MARK: - Model list
 
     private struct ModelList: Decodable {
-        struct Entry: Decodable { let id: String }
+        /// OpenRouter enriches the standard shape with per-model modalities —
+        /// the one OpenAI-compatible endpoint that states capabilities outright.
+        struct Architecture: Decodable {
+            let inputModalities: [String]?
+            enum CodingKeys: String, CodingKey {
+                case inputModalities = "input_modalities"
+            }
+        }
+        struct Entry: Decodable {
+            let id: String
+            let architecture: Architecture?
+        }
         let data: [Entry]
+    }
+
+    /// Split out (and non-private) so the attach-caps harness can feed it fixture
+    /// JSON: ids as before, plus capabilities for exactly the entries that state
+    /// their modalities — absence stays absence, never a guess.
+    nonisolated static func decodeModelList(_ data: Data) throws -> (ids: [String], capabilities: [String: ModelCapabilities]) {
+        let list = try JSONDecoder().decode(ModelList.self, from: data)
+        var capabilities: [String: ModelCapabilities] = [:]
+        for entry in list.data {
+            guard let modalities = entry.architecture?.inputModalities else { continue }
+            capabilities[entry.id] = ModelCapabilities(
+                images: modalities.contains("image"),
+                files: modalities.contains("file")
+            )
+        }
+        return (list.data.map(\.id).sorted(), capabilities)
     }
 
     func isFetching(_ id: UUID) -> Bool { fetchingProviders.contains(id) }
@@ -678,7 +856,7 @@ final class ProviderStore: ObservableObject {
                 modelFetchErrors[id] = "HTTP \(code) fetching models: \(body)"
                 return
             }
-            let ids = try JSONDecoder().decode(ModelList.self, from: data).data.map(\.id).sorted()
+            let (ids, listCapabilities) = try Self.decodeModelList(data)
             guard !ids.isEmpty else {
                 modelFetchErrors[id] = "\(provider.name) returned an empty model list."
                 return
@@ -690,8 +868,61 @@ final class ProviderStore: ObservableObject {
             if selectedModels[id] == nil, provider.defaultModel.isEmpty, id == selectedID {
                 selectedModels[id] = ids[0]
             }
+            // Capability metadata rides the same fetch. The Ollama probe answers
+            // for endpoints whose /v1 list said nothing (one tiny /api/version
+            // request decides whether the native API is even there).
+            var capabilities = listCapabilities
+            let native = await Self.probeOllamaCapabilities(baseURL: provider.baseURL, models: ids)
+            capabilities.merge(native) { _, probed in probed }
+            modelCapabilities[id] = capabilities.isEmpty ? nil : capabilities
         } catch {
             modelFetchErrors[id] = "Fetching models failed: \(error.localizedDescription)"
+        }
+    }
+
+    /// Ollama's OpenAI-compatible surface exposes no capabilities, but its native
+    /// API does: `/api/show` lists them per model ("vision" is the image answer;
+    /// there is no file input at all). Detection is by probing `/api/version` at
+    /// the same host rather than by preset name, so a custom provider pointed at
+    /// an Ollama gets the same authoritative answer.
+    nonisolated private static func probeOllamaCapabilities(
+        baseURL: String, models: [String]
+    ) async -> [String: ModelCapabilities] {
+        var root = baseURL
+        while root.hasSuffix("/") { root.removeLast() }
+        guard root.hasSuffix("/v1"), let rootURL = URL(string: String(root.dropLast(3))) else { return [:] }
+
+        struct Version: Decodable { let version: String }
+        var versionRequest = URLRequest(url: rootURL.appending(path: "api/version"))
+        versionRequest.timeoutInterval = 4
+        guard let (versionData, versionResponse) = try? await URLSession.shared.data(for: versionRequest),
+              (versionResponse as? HTTPURLResponse)?.statusCode == 200,
+              (try? JSONDecoder().decode(Version.self, from: versionData)) != nil else { return [:] }
+
+        struct Show: Decodable { let capabilities: [String]? }
+        let showURL = rootURL.appending(path: "api/show")
+        return await withTaskGroup(of: (String, ModelCapabilities)?.self) { group in
+            // A local server answers these in milliseconds; the cap is a backstop
+            // against someone proxying a huge catalog through an Ollama-shaped URL.
+            for model in models.prefix(100) {
+                group.addTask {
+                    var request = URLRequest(url: showURL)
+                    request.httpMethod = "POST"
+                    request.timeoutInterval = 10
+                    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    request.httpBody = try? JSONSerialization.data(withJSONObject: ["model": model])
+                    guard let (data, response) = try? await URLSession.shared.data(for: request),
+                          (response as? HTTPURLResponse)?.statusCode == 200,
+                          let show = try? JSONDecoder().decode(Show.self, from: data),
+                          let capabilities = show.capabilities else { return nil }
+                    return (model, ModelCapabilities(images: capabilities.contains("vision"), files: false))
+                }
+            }
+            var result: [String: ModelCapabilities] = [:]
+            for await entry in group {
+                if let (model, capabilities) = entry { result[model] = capabilities }
+            }
+            return result
         }
     }
 
