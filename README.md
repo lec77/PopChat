@@ -1,33 +1,27 @@
 # PopChat
 
-A lightweight macOS menu bar app: press a global hotkey (default **⌥Space**) and a floating chat panel appears with the input already focused. Press it again (or **Esc**) and the panel disappears, returning focus to whatever app you were in.
+[![License: MIT](https://img.shields.io/github/license/lec77/PopChat)](LICENSE)
+![Platform](https://img.shields.io/badge/platform-macOS%2014%2B-blue)
+![Latest release](https://img.shields.io/github/v/release/lec77/PopChat)
 
-It restores the old ChatGPT-app popup experience — instant, non-activating, always a keystroke away — but you point it at whichever model you want: your ChatGPT subscription, an API key, or a model running locally.
+A mini AI chat app for quick, small (and usually temporary) chats — the kind that don't need a frontier model, so it pairs nicely with lighter, locally-run ones.
 
-Native Swift + SwiftUI, no Electron. Menu-bar only, no Dock icon.
+Press a global hotkey (default **⌥Space**) and a floating chat panel appears with the input already focused. Pin it if you want to keep the messages as a reference for your other work.
 
-<!-- Screenshot goes here — drop the file in docs/ and uncomment:
-<p align="center"><img src="docs/screenshot.png" width="720" alt="PopChat panel over a desktop"></p>
--->
+<p align="center"><img src="Resources/screenshot.png" width="720" alt="PopChat panel over a desktop"></p>
+
 
 ## Features
 
 - **Instant panel** — a non-activating `NSPanel`, so showing it never steals focus from the app underneath and dismissing it returns focus immediately. Remembers where you last dragged it. ⌘P pins it open.
-- **Any OpenAI-compatible provider** — OpenAI, OpenRouter, Ollama, or any custom endpoint (DeepSeek, Groq, LM Studio, …), plus model discovery via `/models`. Switch provider and model from a pill in the panel header. Models with explicit reasoning capabilities get a third **Effort** column, remembered independently per provider/model.
-- **ChatGPT subscription (two paths)** — use a locally installed, signed-in Codex through `codex app-server` (preferred), or keep using PopChat's existing direct OAuth/backend adapter (unofficial and explicitly marked as potentially risky in Settings).
-- **Streaming with a typewriter feel**, a stop button, and errors surfaced in the transcript rather than swallowed.
-- **Web search & fetch** — the model can call `web_search` and `fetch_url` in a capped loop, shown as gray activity rows in the transcript. Backends: DuckDuckGo (default, no key), Tavily, Brave, or OpenRouter's native web plugin. Globe toggle in the input bar.
-- **Attachments** — drag & drop, ⌘V paste (files *and* raw screenshots), or the paperclip picker. Images become vision blocks; PDF / docx / rtf / xlsx / csv are extracted to text. Anything it can't handle produces an explicit error instead of degrading silently.
-- **Conversations** — persisted as JSON, most recent auto-resumed at launch, filterable history popover (⌘Y) with day groups. Any assistant message can be **forked** into a new branch that shares the history up to that point.
+- **Any OpenAI-compatible provider** — OpenAI, OpenRouter, or any custom endpoint, plus local models via Ollama or LM Studio (no API key needed). Switch provider and model from a pill in the panel header.
 - **Slash commands** — your own prompt templates with a `{input}` placeholder and an autocomplete popup when the draft starts with `/`.
-- **Rich rendering** — markdown with cross-block text selection, syntax-highlighted code blocks, LaTeX (`$…$`, `$$…$$`), hairline tables, and `<pasteable>` blocks: one-click-copy cards for reusable content the model produces.
-- **Find in chat** (⌘F) — match count, wrapping ↑/↓ navigation, highlights painted at the exact character range and scrolled into view.
 - **Large editor** (⌘E) — the input capsule morphs into a full draft editor; ⌘↩ sends.
 - **Liquid-glass look** on macOS 26 (translucent panel with an adjustable tint), a solid fallback below that, Light/Dark/Auto appearance, four accent presets plus a custom color picker, and full support for Reduce Motion / Reduce Transparency.
 
 ## Install
 
-Download the latest `PopChat-x.y.z.dmg` from [Releases](https://github.com/lec77/PopChat/releases), open it, and drag PopChat to Applications. The disk image is signed and notarized, so it opens without a Gatekeeper detour. Settings → General has a launch-at-login toggle.
+Download the latest `PopChat-x.y.z.dmg` from [Releases](https://github.com/lec77/PopChat/releases), open it, and drag PopChat to Applications.
 
 Requires **macOS 14 or later**. The liquid-glass backdrop needs macOS 26; older systems get a solid panel.
 
