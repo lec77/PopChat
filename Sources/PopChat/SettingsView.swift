@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import KeyboardShortcuts
 import ServiceManagement
@@ -681,15 +682,19 @@ struct SettingsView: View {
     @ViewBuilder
     private var codexAppServerRows: some View {
         editorField("Codex path") {
-            TextField("Auto-detect", text: $codexExecutablePath)
-                .help("Leave empty to search common locations, or enter the full path to the codex executable.")
-                .onChange(of: codexExecutablePath) { _, _ in
-                    // Not just a status reset: this also bumps the generation so a
-                    // check already running against the OLD path cannot publish
-                    // over this, and clears the once-per-launch auto-fetch flag so
-                    // the switcher will actually re-probe the corrected path.
-                    store.invalidateCodexAppServer()
-                }
+            HStack(spacing: 6) {
+                TextField("Auto-detect", text: $codexExecutablePath)
+                    .help("Leave empty to auto-detect (PopChat checks common install locations, then asks your login shell), or enter the path `which codex` prints in Terminal.")
+                    .onChange(of: codexExecutablePath) { _, _ in
+                        // Not just a status reset: this also bumps the generation so a
+                        // check already running against the OLD path cannot publish
+                        // over this, and clears the once-per-launch auto-fetch flag so
+                        // the switcher will actually re-probe the corrected path.
+                        store.invalidateCodexAppServer()
+                    }
+                Button("Locate…") { locateCodexExecutable() }
+                    .help("Choose the codex executable — the file `which codex` points at.")
+            }
         }
         HStack(spacing: 8) {
             switch store.codexAppServerStatus {
@@ -703,7 +708,10 @@ struct SettingsView: View {
                 Text(detail.isEmpty ? "Signed in with ChatGPT" : detail)
             case .missing:
                 Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
-                Text("Codex executable not found")
+                // The user's next question is always "then what path do I enter?"
+                // — answer it here, where the field is.
+                Text("Codex not found — run `which codex` in Terminal and paste the result above, or click Locate…")
+                    .lineLimit(3)
             case .notSignedIn:
                 Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.orange)
                 Text("Codex is not signed in with ChatGPT")
@@ -735,6 +743,27 @@ struct SettingsView: View {
             .font(.caption)
             .foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// File-picker alternative to typing a path — for the user who has codex
+    /// installed somewhere auto-detect missed and doesn't live in a terminal.
+    private func locateCodexExecutable() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        // codex usually lives in a hidden directory (~/.nvm, ~/.local, /usr/local).
+        panel.showsHiddenFiles = true
+        panel.message = "Select the codex executable (the path `which codex` prints in Terminal)."
+        let current = codexExecutablePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !current.isEmpty {
+            panel.directoryURL = URL(fileURLWithPath: current).deletingLastPathComponent()
+        }
+        if panel.runModal() == .OK, let url = panel.url {
+            // Assigning the binding runs the field's onChange, which invalidates
+            // the cached status and re-arms the on-demand check.
+            codexExecutablePath = url.path
+        }
     }
 
     // MARK: - Web Search

@@ -88,10 +88,22 @@ enum ChatGPTAuth {
 
     private static let secretsAccount = "chatgpt-oauth"
 
+    /// Decode cache: `isSignedIn` sits on render paths (the header pill asks it
+    /// per ChatView body evaluation — ~30×/s during a streaming reveal), and a
+    /// JSONDecoder round-trip per call is exactly the hot-path waste the perf
+    /// rules police. Keyed on the raw JSON so every writer — save, signOut, a
+    /// refresh — invalidates it naturally; the key compare is O(1) in practice
+    /// because SecretStore hands back the same cached string instance.
+    /// Main-thread only, like SecretStore itself (the async refresh flows
+    /// already hop to MainActor to call this).
+    private static var tokensCache: (json: String, tokens: Tokens?)?
+
     private static func loadTokens() -> Tokens? {
-        guard let json = SecretStore.get(account: secretsAccount),
-              let data = json.data(using: .utf8) else { return nil }
-        return try? JSONDecoder().decode(Tokens.self, from: data)
+        guard let json = SecretStore.get(account: secretsAccount) else { return nil }
+        if let cached = tokensCache, cached.json == json { return cached.tokens }
+        let tokens = json.data(using: .utf8).flatMap { try? JSONDecoder().decode(Tokens.self, from: $0) }
+        tokensCache = (json, tokens)
+        return tokens
     }
 
     private static func save(_ tokens: Tokens) {

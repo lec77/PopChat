@@ -23,6 +23,11 @@ struct ProviderConfig {
 enum ChatStreamEvent {
     case partial(String)
     case activity(String)
+    /// Transient lifecycle note ("Starting Codex…", "Reasoning…") shown in the
+    /// waiting row while the reply is still empty. Unlike `.activity` it is
+    /// never persisted into the transcript — per-turn startup noise would
+    /// clutter every conversation with gray rows.
+    case status(String)
     case done(String)
     case error(String)
 }

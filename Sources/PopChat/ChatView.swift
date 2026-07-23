@@ -259,10 +259,19 @@ struct ChatView: View {
     }
 
     private var switcherLabel: String {
-        let provider = providerStore.selectedProvider?.name ?? "No provider"
+        // A fresh install has a selection (selectedID is non-optional) but no
+        // configured provider — naming one here reads as "ready to chat" and the
+        // user only learns otherwise from an error after typing. Say what the
+        // next step actually is; the click lands in the switcher, whose footer
+        // opens Settings › Providers. hasSetupEvidence, NOT isConfigured: a
+        // transient failed Codex check must not rename a set-up provider mid-
+        // conversation. (Cheap per render: secrets and tokens are memory-cached,
+        // the rest are dictionary lookups.)
+        guard let provider = providerStore.selectedProvider,
+              providerStore.hasSetupEvidence(provider) else { return "Set up a provider…" }
         let model = providerStore.currentModel
         let effort = providerStore.currentReasoningEffort.map { " · \($0)" } ?? ""
-        return "\(provider) · \(model.isEmpty ? "no model" : model)\(effort)"
+        return "\(provider.name) · \(model.isEmpty ? "no model" : model)\(effort)"
     }
 
     // MARK: - Transcript
@@ -297,6 +306,12 @@ struct ChatView: View {
                                     activeOccurrence: activeHit?.messageID == id ? activeHit?.occurrence : nil
                                 )
                                 : nil
+                            // Nil for every row but the still-empty streaming one
+                            // (same gating trick as `find`), so status updates
+                            // repaint exactly one row.
+                            let waiting: String? = id == streamingID && message.text.isEmpty
+                                ? (store.pendingStatus ?? "Thinking…")
+                                : nil
                             MessageRow(
                                 message: message,
                                 // The caret rides the fade head (Delta 4), so it
@@ -306,6 +321,7 @@ struct ChatView: View {
                                 bubbleMaxWidth: bubbleMaxWidth,
                                 find: rowFind,
                                 reveal: revealing ? revealFade : nil,
+                                waitingStatus: waiting,
                                 onFork: { store.fork(at: id) },
                                 fullText: { store.fullText(of: id) }
                             )
@@ -640,6 +656,10 @@ private struct MessageRow: View, Equatable {
     /// `message.text` does NOT change (running out after the last commit), and
     /// without this the row would stay gated and the head would never settle.
     var reveal: TextReveal?
+    /// Non-nil only for the streaming row while it has NO text yet: the label the
+    /// waiting indicator pulses ("Thinking…", or the provider's latest `.status`).
+    /// Part of == so a status change repaints exactly this row.
+    var waitingStatus: String?
     /// Ignored by ==: it captures only stable references (store + message id).
     var onFork: () -> Void = {}
     /// Likewise ignored by ==. Resolves at click time to the text that has
@@ -663,6 +683,7 @@ private struct MessageRow: View, Equatable {
             && lhs.showCaret == rhs.showCaret
             && lhs.find == rhs.find
             && lhs.reveal == rhs.reveal
+            && lhs.waitingStatus == rhs.waitingStatus
             && abs(lhs.bubbleMaxWidth - rhs.bubbleMaxWidth) < 0.5
     }
 
@@ -702,47 +723,56 @@ private struct MessageRow: View, Equatable {
             }
             .frame(maxWidth: .infinity, alignment: .trailing)
         case .assistant:
-            VStack(alignment: .leading, spacing: 4) {
-                AssistantMessageView(
-                    text: message.text, showCaret: showCaret, find: find, reveal: reveal
-                )
-                // Always visible once the response is complete; occupies its
-                // space during streaming (opacity only) so finishing never
-                // reflows the transcript.
-                if !message.text.isEmpty {
-                    HStack(spacing: 12) {
-                        Button {
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(fullText(), forType: .string)
-                            copied = true
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { copied = false }
-                        } label: {
-                            Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
-                                .padding(.vertical, 2)
-                                .contentShape(Rectangle())
+            // Before the first token the row has nothing but a caret to show, and
+            // a Codex cold start plus silent reasoning can hold that state for
+            // tens of seconds — which reads as a frozen app. Pulse a status
+            // instead until real text arrives.
+            if let waitingStatus, message.text.isEmpty {
+                WaitingIndicator(status: waitingStatus)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                VStack(alignment: .leading, spacing: 4) {
+                    AssistantMessageView(
+                        text: message.text, showCaret: showCaret, find: find, reveal: reveal
+                    )
+                    // Always visible once the response is complete; occupies its
+                    // space during streaming (opacity only) so finishing never
+                    // reflows the transcript.
+                    if !message.text.isEmpty {
+                        HStack(spacing: 12) {
+                            Button {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(fullText(), forType: .string)
+                                copied = true
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { copied = false }
+                            } label: {
+                                Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
+                                    .padding(.vertical, 2)
+                                    .contentShape(Rectangle())
+                            }
+                            .help("Copy the whole response")
+                            Button(action: onFork) {
+                                Label("Fork", systemImage: "arrow.triangle.branch")
+                                    .padding(.vertical, 2)
+                                    .contentShape(Rectangle())
+                            }
+                            .help("Start a new conversation from this point")
                         }
-                        .help("Copy the whole response")
-                        Button(action: onFork) {
-                            Label("Fork", systemImage: "arrow.triangle.branch")
-                                .padding(.vertical, 2)
-                                .contentShape(Rectangle())
-                        }
-                        .help("Start a new conversation from this point")
+                        .buttonStyle(.plain)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .labelStyle(.titleAndIcon)
+                        .opacity(showCaret ? 0 : 1)
                     }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .labelStyle(.titleAndIcon)
-                    .opacity(showCaret ? 0 : 1)
                 }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contextMenu {
-                Button("Copy Message") {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(fullText(), forType: .string)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contextMenu {
+                    Button("Copy Message") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(fullText(), forType: .string)
+                    }
+                    Button("Fork Here", action: onFork)
                 }
-                Button("Fork Here", action: onFork)
             }
         case .activity:
             Label { Text(FindHighlight.paint(message.text, find: textFind)) } icon: {
@@ -759,6 +789,58 @@ private struct MessageRow: View, Equatable {
                 .foregroundStyle(.red)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+/// What an empty streaming row shows while the network turn has produced no text
+/// yet: a pulsing status plus, once the wait is long enough to read as a hang,
+/// an elapsed counter. The pulse is a repeatForever opacity animation — CA-driven
+/// per the caret rule, so no tick ever re-evaluates SwiftUI. Replaced by the
+/// normal caret/text rendering the moment the first characters commit.
+private struct WaitingIndicator: View {
+    let status: String
+    @AppStorage("accentColor") private var accentHex = Theme.defaultAccentHex
+    @State private var pulsing = false
+    @State private var startedAt = Date()
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(Theme.color(accentHex))
+                .frame(width: 7, height: 7)
+                .opacity(pulsing ? 0.25 : 1)
+            Text(status)
+                .font(.system(size: 13))
+                .foregroundStyle(.secondary)
+                .opacity(pulsing ? 0.55 : 1)
+            ElapsedLabel(since: startedAt)
+        }
+        .padding(.vertical, 4)
+        .onAppear {
+            withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) {
+                pulsing = true
+            }
+        }
+    }
+}
+
+/// "24s" beside the waiting status — appears only after 8 s, when slow starts
+/// needing reassurance separate from ordinary latency. A 1 Hz TimelineView on
+/// its own leaf view: seeded from a stable @State date, never `.now` (which
+/// would re-create the schedule on every evaluation — the trap the caret rule
+/// exists for), so a tick re-evaluates nothing but this label.
+private struct ElapsedLabel: View {
+    let since: Date
+
+    var body: some View {
+        TimelineView(.periodic(from: since, by: 1)) { context in
+            let seconds = Int(context.date.timeIntervalSince(since))
+            if seconds >= 8 {
+                Text("\(seconds)s")
+                    .font(.system(size: 11).monospacedDigit())
+                    .foregroundStyle(.tertiary)
+            }
         }
     }
 }

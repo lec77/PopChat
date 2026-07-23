@@ -40,6 +40,8 @@ if smokePlain || smokeSearch || smokePasteable {
                 chunks += 1
             case .activity(let text):
                 print("[activity] \(text)")
+            case .status(let text):
+                print("[status] \(text)")
             case .done(let text):
                 print("chunks=\(chunks)\nfinal=\(text)")
                 if smokePasteable {
@@ -295,6 +297,7 @@ if CommandLine.arguments.contains("--smoke-codex-app-server-search") {
                 case .partial(let value), .done(let value): text = value
                 case .activity(let value):
                     if value.contains("searched the web") { searched = true }
+                case .status: break
                 case .error(let value): failure = value
                 }
             }
@@ -355,7 +358,7 @@ if let flag = CommandLine.arguments.firstIndex(of: "--smoke-codex-app-server-str
                 final = text
             case .done(let text):
                 final = text
-            case .activity:
+            case .activity, .status:
                 break
             case .error(let message):
                 failure = message
@@ -498,6 +501,8 @@ if CommandLine.arguments.contains("--smoke-chatgpt") {
                 chunks += 1
             case .activity(let text):
                 print("[activity] \(text)")
+            case .status(let text):
+                print("[status] \(text)")
             case .done(let text):
                 print("chunks=\(chunks)\nfinal=\(text)")
                 exit(text.isEmpty ? 1 : 0)

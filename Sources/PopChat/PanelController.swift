@@ -81,7 +81,7 @@ final class PanelController: NSObject, NSWindowDelegate {
         // min/max constraints to zero during layout, so contentMinSize writes
         // are silently discarded once the content view is attached.
         panel.delegate = self
-        panel.onCancel = { [weak self] in self?.hide() }
+        panel.onCancel = { [weak self] in self?.dismiss() }
         panel.onAttachablePaste = {
             NotificationCenter.default.post(name: .popChatAttachPasteboard, object: nil)
         }
@@ -91,7 +91,7 @@ final class PanelController: NSObject, NSWindowDelegate {
                 store: chatStore,
                 providerStore: providerStore,
                 shortcutStore: shortcutStore,
-                onClose: { [weak self] in self?.hide() },
+                onClose: { [weak self] in self?.dismiss() },
                 onCompactHeightChange: { [weak self] height in self?.compactHeightChanged(height) }
             )
         )
@@ -117,11 +117,24 @@ final class PanelController: NSObject, NSWindowDelegate {
     /// asks, and the one a new user is really asking when they double-click.
     var isPanelOnScreen: Bool { panel.isVisible }
 
+    /// Fired on USER-initiated dismissals only (hotkey, Esc, ⌘W, close button) —
+    /// AppDelegate hooks it to close the Settings window along with the panel.
+    /// The focus-loss auto-hide (`windowDidResignKey`) calls `hide()` directly
+    /// and must NOT fire this: it triggers exactly when the user clicks into
+    /// another app, e.g. to copy an API key for the Settings window.
+    var onUserDismiss: (() -> Void)?
+
+    /// A user saying "go away", as opposed to the panel merely losing relevance.
+    func dismiss() {
+        onUserDismiss?()
+        hide()
+    }
+
     func toggle() {
         if !panel.isVisible {
             show()
         } else if panel.isKeyWindow {
-            hide()
+            dismiss()
         } else {
             // Visible but unfocused (pinned mode): the hotkey pulls focus back first;
             // a second press then dismisses.

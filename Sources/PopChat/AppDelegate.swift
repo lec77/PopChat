@@ -34,6 +34,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.panelController.toggle()
         }
 
+        // "Dismiss PopChat" means all of it: a floating Settings window left
+        // hovering over the app the user returned to reads as stuck. Only
+        // USER-initiated dismissals (hotkey, Esc, ⌘W, close button) fire this —
+        // the focus-loss auto-hide must not yank Settings away while the user
+        // is off copying an API key from another app.
+        panelController.onUserDismiss = { [weak self] in
+            self?.settingsWindow?.close()
+        }
+
         NotificationCenter.default.addObserver(
             forName: .popChatOpenSettings, object: nil, queue: .main
         ) { [weak self] _ in
@@ -149,6 +158,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
         settingsItem.target = self
         appMenu.addItem(settingsItem)
+        // ⌘W. No visible menu bar means no File/Window menu, so without this the
+        // Settings window closes only via its traffic-light X — and the panel
+        // ignores ⌘W entirely.
+        let closeItem = NSMenuItem(title: "Close Window", action: #selector(closeKeyWindow), keyEquivalent: "w")
+        closeItem.target = self
+        appMenu.addItem(closeItem)
         appMenuItem.submenu = appMenu
         mainMenu.addItem(appMenuItem)
 
@@ -168,9 +183,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.mainMenu = mainMenu
     }
 
+    /// ⌘W: hide the panel (a user dismissal, so Settings goes with it) or close
+    /// whatever other closable window is key. Popover windows aren't closable
+    /// and fall through to a no-op.
+    @objc private func closeKeyWindow() {
+        guard let key = NSApp.keyWindow else { return }
+        if key is FloatingPanel {
+            panelController.dismiss()
+        } else if key.styleMask.contains(.closable) {
+            key.performClose(nil)
+        }
+    }
+
     @objc private func openSettings() {
         if settingsWindow == nil {
-            let window = NSWindow(
+            let window = DismissOnEscWindow(
                 contentRect: NSRect(x: 0, y: 0, width: 540, height: 620),
                 styleMask: [.titled, .closable],
                 backing: .buffered,
@@ -187,5 +214,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         NSApp.activate(ignoringOtherApps: true)
         settingsWindow?.makeKeyAndOrderFront(nil)
+    }
+}
+
+/// Settings window for an LSUIElement app: no Window menu exists, so Esc has to
+/// be handled by the window itself (⌘W comes from the invisible main menu).
+/// Intercepted in `sendEvent`, not `cancelOperation`: a focused text field's
+/// editor consumes Esc first — NSTextView turns it into the completion popup —
+/// so the responder chain never reaches the window. The one Esc that must keep
+/// its normal meaning is an in-progress IME composition (the Commands tab takes
+/// CJK input), hence the marked-text guard.
+private final class DismissOnEscWindow: NSWindow {
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .keyDown,
+           event.keyCode == 53, // Esc
+           event.modifierFlags.intersection([.command, .option, .control]).isEmpty,
+           !((firstResponder as? NSTextView)?.hasMarkedText() ?? false) {
+            close()
+            return
+        }
+        super.sendEvent(event)
     }
 }

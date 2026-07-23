@@ -49,6 +49,10 @@ enum CodexAppServerClient {
 
     /// Finder-launched apps have a small PATH, so also check the common Codex
     /// install locations. An explicit path wins when the user supplies one.
+    ///
+    /// May block for seconds (the login-shell probe below), so it must only run
+    /// on the dedicated check/turn queues — never the main thread or a Swift
+    /// concurrency cooperative task.
     static func executableURL() -> URL? {
         let defaultsPath = UserDefaults.standard.string(forKey: executablePathKey)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -62,6 +66,9 @@ enum CodexAppServerClient {
             "/usr/local/bin/codex",
             "\(home)/.local/bin/codex",
             "\(home)/.npm-global/bin/codex",
+            "\(home)/.cargo/bin/codex",
+            "\(home)/.volta/bin/codex",
+            "\(home)/.bun/bin/codex",
         ].compactMap { $0 }.filter { !$0.isEmpty }
 
         for candidate in candidates where FileManager.default.isExecutableFile(atPath: candidate) {
@@ -73,13 +80,150 @@ enum CodexAppServerClient {
             let candidate = URL(fileURLWithPath: String(directory)).appending(path: "codex")
             if FileManager.default.isExecutableFile(atPath: candidate.path) { return candidate }
         }
-        return nil
+
+        return loginShellCodexURL()
+    }
+
+    /// Last resort: ask the user's own login shell for its PATH and search that
+    /// ourselves. Version managers (nvm, asdf, fnm, custom prefixes) install
+    /// codex wherever their init scripts decide, and the fixed candidates above
+    /// can't chase every layout — but `$SHELL` sources those same scripts, so
+    /// its PATH finds codex exactly where the user's terminal does. Details that
+    /// are all load-bearing (each one is a review counterexample):
+    /// - PATH + marker, not `command -v codex`: in an interactive shell an
+    ///   alias shadows the lookup (`command -v` prints the alias DEFINITION
+    ///   with exit 0, so a fallback after `||` never runs), and rc greetings
+    ///   drown plain output — the marker line is unambiguous whatever the rc
+    ///   files print.
+    /// - Interactive (-i) as well as login (-l): nvm and friends initialize in
+    ///   rc files a plain login shell never reads; stdin is /dev/null so
+    ///   nothing can prompt. csh/tcsh REJECT -l combined with any other flag
+    ///   ("Unknown option"), so they get plain -i -c — csh-family PATH setup
+    ///   lives in .cshrc/.tcshrc anyway. fish needs its own script because its
+    ///   $PATH is a LIST that echoes space-separated (and paths contain
+    ///   spaces), so it colon-joins explicitly.
+    /// - The pipe is read INCREMENTALLY and parsed even on timeout: an rc file
+    ///   that spawns a background process (ssh agent, tmux hook) leaves the
+    ///   write end open and holds off EOF forever, and waiting for EOF would
+    ///   throw away a marker line that arrived within milliseconds.
+    /// Cached on success only — and re-validated on read — so "Check Again"
+    /// after installing codex (or nvm-switching it away) actually re-probes.
+    private static func loginShellCodexURL() -> URL? {
+        if let cached = shellProbeCache.get() { return cached }
+        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        let shellName = URL(fileURLWithPath: shell).lastPathComponent
+        let marker = "POPCHAT-CODEX-PATH:"
+        let flags: [String]
+        let script: String
+        switch shellName {
+        case "csh", "tcsh":
+            flags = ["-i", "-c"]
+            script = "echo \(marker)$PATH"
+        case "fish":
+            flags = ["-l", "-i", "-c"]
+            script = "echo \(marker)(string join : $PATH)"
+        default: // zsh, bash, dash, ksh, …
+            flags = ["-l", "-i", "-c"]
+            script = "echo \(marker)$PATH"
+        }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: shell)
+        process.arguments = flags + [script]
+        process.standardInput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        let stdout = Pipe()
+        process.standardOutput = stdout
+        do { try process.run() } catch { return nil }
+
+        let buffer = ProbeBuffer(marker: marker)
+        stdout.fileHandleForReading.readabilityHandler = { handle in
+            buffer.append(handle.availableData)
+        }
+        buffer.waitForMarkerLine(timeout: 10)
+        stdout.fileHandleForReading.readabilityHandler = nil
+        // Done either way — a shell still alive here is stuck in an rc file.
+        // (No waitUntilExit: Process reaps the child on its own, and the whole
+        // point of the incremental read is not to wait on stragglers.)
+        if process.isRunning { process.terminate() }
+
+        guard let path = buffer.markerPayload()?
+            .split(separator: ":")
+            .map({ $0.trimmingCharacters(in: .whitespaces) + "/codex" })
+            .first(where: { FileManager.default.isExecutableFile(atPath: $0) })
+        else { return nil }
+        let url = URL(fileURLWithPath: path)
+        shellProbeCache.set(url)
+        return url
+    }
+
+    private static let shellProbeCache = ShellProbeCache()
+
+    private final class ShellProbeCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var found: URL?
+        /// Re-validated on every read: an nvm/npm version switch deletes the
+        /// old bin directory, and "Check Again" must re-probe rather than
+        /// resurrect a dead path until relaunch.
+        func get() -> URL? {
+            lock.lock()
+            defer { lock.unlock() }
+            if let cached = found, !FileManager.default.isExecutableFile(atPath: cached.path) {
+                found = nil
+            }
+            return found
+        }
+        func set(_ url: URL) { lock.lock(); defer { lock.unlock() }; found = url }
+    }
+
+    /// Thread-safe accumulator for the shell probe's stdout: the readability
+    /// handler appends from FileHandle's own queue, the probing queue blocks
+    /// until a COMPLETE marker line is present (PATH can span chunks), the pipe
+    /// closes, or the deadline passes — whichever comes first.
+    private final class ProbeBuffer: @unchecked Sendable {
+        private let lock = NSLock()
+        private let ready = DispatchSemaphore(value: 0)
+        private let marker: String
+        private var data = Data()
+        private var closed = false
+
+        init(marker: String) { self.marker = marker }
+
+        func append(_ chunk: Data) {
+            lock.lock()
+            if chunk.isEmpty { closed = true } else { data.append(chunk) }
+            let done = closed || completedMarkerLine() != nil
+            lock.unlock()
+            if done { ready.signal() }
+        }
+
+        func waitForMarkerLine(timeout: TimeInterval) {
+            _ = ready.wait(timeout: .now() + timeout)
+        }
+
+        /// The text after the marker, once its line is complete — or whatever
+        /// of it arrived, when the pipe closed or the deadline hit.
+        func markerPayload() -> String? {
+            lock.lock()
+            defer { lock.unlock() }
+            if let line = completedMarkerLine() { return line }
+            // Deadline/EOF fallback: take the partial tail. A truncated PATH
+            // still yields its complete leading entries after the colon split.
+            let text = String(decoding: data, as: UTF8.self)
+            guard let range = text.range(of: marker, options: .backwards) else { return nil }
+            return String(text[range.upperBound...])
+        }
+
+        /// Caller must hold `lock`.
+        private func completedMarkerLine() -> String? {
+            let text = String(decoding: data, as: UTF8.self)
+            guard let range = text.range(of: marker, options: .backwards) else { return nil }
+            let tail = text[range.upperBound...]
+            guard let newline = tail.firstIndex(of: "\n") else { return nil }
+            return String(tail[..<newline])
+        }
     }
 
     static func inspect(includeModels: Bool = true) async throws -> Inspection {
-        guard let executable = executableURL() else {
-            throw ClientError(message: missingMessage, reason: .missing)
-        }
         let holder = SessionHolder()
         return try await withThrowingTaskGroup(of: Inspection.self) { group in
             group.addTask(priority: .userInitiated) {
@@ -96,7 +240,6 @@ enum CodexAppServerClient {
                         queue.async {
                             continuation.resume(with: Result {
                                 try inspectBlocking(
-                                    executable: executable,
                                     includeModels: includeModels,
                                     holder: holder
                                 )
@@ -124,10 +267,16 @@ enum CodexAppServerClient {
     }
 
     private static func inspectBlocking(
-        executable: URL,
         includeModels: Bool,
         holder: SessionHolder
     ) throws -> Inspection {
+        // Resolved HERE, on the dedicated queue, not in async `inspect` — the
+        // login-shell probe inside executableURL() can block for seconds and
+        // must stay off the cooperative pool. The 30s race in `inspect` covers
+        // the probe as well.
+        guard let executable = executableURL() else {
+            throw ClientError(message: missingMessage, reason: .missing)
+        }
         let session = try Session(executable: executable)
         holder.set(session)
         defer { session.stop() }
@@ -230,6 +379,11 @@ enum CodexAppServerClient {
         continuation: AsyncStream<ChatStreamEvent>.Continuation
     ) {
         do {
+            // A fresh child per turn means seconds of silence before the first
+            // token — say what is happening or the app reads as frozen. These
+            // are `.status` (transient, shown in the waiting row), not
+            // `.activity` (permanent transcript rows).
+            continuation.yield(.status("Starting Codex…"))
             guard let executable = executableOverride ?? executableURL() else {
                 throw ClientError(message: missingMessage, reason: .missing)
             }
@@ -307,6 +461,7 @@ enum CodexAppServerClient {
             // A turn can start emitting notifications before app-server writes the
             // matching JSON-RPC response. Waiting through `request` would buffer
             // those deltas and make the whole answer appear at once.
+            continuation.yield(.status("Waiting for \(config.model)…"))
             let turnRequestID = try session.beginRequest(method: "turn/start", params: turnParams)
             // A turn can produce SEVERAL agentMessage items (a preamble, then the
             // answer). Deltas belong to the item currently streaming, and
@@ -336,6 +491,10 @@ enum CodexAppServerClient {
                 case "item/started":
                     if let activity = activityLabel(item: params["item"]?.objectValue) {
                         continuation.yield(.activity(activity))
+                    } else if params["item"]?.objectValue?["type"]?.stringValue == "reasoning" {
+                        // Reasoning items stream no visible text but can run for
+                        // a long time — the one signal that the model is alive.
+                        continuation.yield(.status("Reasoning…"))
                     }
                 case "item/completed":
                     if let item = params["item"]?.objectValue,
@@ -405,7 +564,7 @@ enum CodexAppServerClient {
         return "Codex app-server stopped responding: no protocol event arrived for \(duration). Stop the turn or update Codex, then try again."
     }
 
-    private static let missingMessage = "Codex is not installed or PopChat cannot find it. Install Codex yourself, run `codex login`, then set its executable path in Settings → Providers if needed."
+    private static let missingMessage = "Codex is not installed or PopChat cannot find it. Install Codex yourself and run `codex login`. If it is already installed, run `which codex` in Terminal and paste the result into the Codex path field in Settings → Providers."
 
     private struct Account: Sendable {
         var email: String?

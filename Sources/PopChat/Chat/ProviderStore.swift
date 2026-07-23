@@ -200,6 +200,16 @@ final class ProviderStore: ObservableObject {
         self.knownModelEfforts = knownModelEfforts
         self.defaultModelEfforts = defaultModelEfforts
         self.selectedModelEfforts = selectedModelEfforts
+        // Fresh install (no stored selection): don't pretend the first preset is
+        // usable — `migrated[0]` is the ChatGPT-subscription preset, which nobody
+        // has signed into yet, and the pill would confidently name a provider
+        // that cannot send. Prefer whatever IS configured (a reinstall's secrets
+        // file, a persisted Codex catalog, a local server with a chosen model).
+        // The positional fallback above stays only so `selectedID` remains
+        // non-optional; ChatView renders that state as "Set up a provider".
+        if selectedID == nil, let configured = migrated.first(where: { isConfigured($0) }) {
+            self.selectedID = configured.id
+        }
         // didSet does not fire during init — persist the seeded/migrated state explicitly.
         persistJSON(self.providers, key: Keys.providers)
         persistJSON(self.selectedModels, key: Keys.selectedModels)
@@ -318,6 +328,22 @@ final class ProviderStore: ObservableObject {
     /// the pill must never name a provider its own list omits. Settings shows all.
     var configuredProviders: [Provider] {
         providers.filter { isConfigured($0) || $0.id == selectedID }
+    }
+
+    /// The header pill's question — "was this ever set up?" — as opposed to
+    /// `isConfigured`'s "is it usable right now?". The difference is the Codex
+    /// app-server's live status: a transient check failure (30s inspect cap,
+    /// codex mid-update) flips `isConfigured` false, and the pill renaming a
+    /// selected, catalog-bearing provider to "Set up a provider…" mid-
+    /// conversation tells a fully-configured user a lie. Setup evidence is the
+    /// same persisted trio the base predicate uses — key, fetched catalog,
+    /// chosen model — plus the live sign-in for the ChatGPT kind (signing out
+    /// erases the evidence, which is exactly right for the pill too).
+    func hasSetupEvidence(_ provider: Provider) -> Bool {
+        if provider.kind == .chatGPT { return ChatGPTAuth.isSignedIn }
+        return !(SecretStore.get(account: provider.id.uuidString) ?? "").isEmpty
+            || !(knownModels[provider.id] ?? []).isEmpty
+            || selectedModels[provider.id] != nil
     }
 
     var currentModel: String {

@@ -303,6 +303,14 @@ enum CodexResponsesClient {
                     continuation.yield(.partial(visible))
                 }
 
+            // Reasoning items stream no visible text but can run for a long
+            // time before the first output token — surface a transient status
+            // so the wait doesn't read as a frozen app.
+            case "response.output_item.added":
+                if (event["item"] as? [String: Any])?["type"] as? String == "reasoning" {
+                    continuation.yield(.status("Reasoning…"))
+                }
+
             case "response.output_item.done":
                 guard var item = event["item"] as? [String: Any],
                       let itemType = item["type"] as? String else { break }

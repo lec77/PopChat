@@ -23,6 +23,11 @@ struct ChatMessage: Identifiable, Equatable, Codable {
 final class ChatStore: ObservableObject {
     @Published private(set) var messages: [ChatMessage] = []
     @Published private(set) var isStreaming = false
+    /// Latest `.status` lifecycle note from the active turn ("Starting Codex…"),
+    /// rendered inside the waiting row while the reply is still empty. Cleared
+    /// the moment visible text arrives and at the end of every turn — it must
+    /// never outlive the wait it describes.
+    @Published private(set) var pendingStatus: String?
     @Published private(set) var recent: [ConversationMeta] = []
     private(set) var conversationID = UUID()
 
@@ -202,7 +207,7 @@ final class ChatStore: ObservableObject {
             if config.apiKey.isEmpty && !isLocal {
                 messages.append(ChatMessage(
                     role: .error,
-                    text: "No API key for \(providerName). Add one via right-click on the menu bar icon → Settings…"
+                    text: "No API key for \(providerName). Add one in Settings → Providers (right-click the menu bar icon), or pick a configured provider from the model pill above."
                 ))
                 persist()
                 return
@@ -231,6 +236,7 @@ final class ChatStore: ObservableObject {
         let assistantMessage = ChatMessage(role: .assistant, text: "")
         messages.append(assistantMessage)
         isStreaming = true
+        pendingStatus = nil
 
         let typewriter = StreamingMode(rawValue: UserDefaults.standard.string(forKey: "streamingMode") ?? "")
             ?? .perCharacter
@@ -259,7 +265,11 @@ final class ChatStore: ObservableObject {
                 switch event {
                 case .partial(let text), .done(let text):
                     streamTarget = text
+                    // The wait this described is over — real text is arriving.
+                    if !text.isEmpty { pendingStatus = nil }
                     startDrain(messageID: assistantMessage.id, mode: typewriter)
+                case .status(let text):
+                    pendingStatus = text
                 case .activity(let text):
                     messages.insert(ChatMessage(role: .activity, text: text), at: assistantIndex)
                     assistantIndex += 1
@@ -275,6 +285,7 @@ final class ChatStore: ObservableObject {
             // button stuck as Stop and Return doing nothing long after the reply
             // had actually arrived.
             isStreaming = false
+            pendingStatus = nil
             await drainTask?.value
             // "Still ours": flushTypewriter() clears streamingMessageID when a new
             // turn takes over mid-reveal, so this must not clobber its bookkeeping.
@@ -558,6 +569,9 @@ final class ChatStore: ObservableObject {
 
     func stop() {
         streamTask?.cancel()
+        // Don't wait for the cancelled task's tail to clear it — the waiting row
+        // must not keep pulsing "Reasoning…" after the user said stop.
+        pendingStatus = nil
         flushTypewriter()
     }
 
