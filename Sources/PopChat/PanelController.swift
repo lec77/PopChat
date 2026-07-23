@@ -124,6 +124,10 @@ final class PanelController: NSObject, NSWindowDelegate {
     /// another app, e.g. to copy an API key for the Settings window.
     var onUserDismiss: (() -> Void)?
 
+    /// Pin is the one explicit "keep PopChat around" — AppDelegate consults it
+    /// before the deactivation dismissal.
+    var isPinned: Bool { state.pinned }
+
     /// A user saying "go away", as opposed to the panel merely losing relevance.
     func dismiss() {
         onUserDismiss?()
@@ -133,11 +137,16 @@ final class PanelController: NSObject, NSWindowDelegate {
     func toggle() {
         if !panel.isVisible {
             show()
-        } else if panel.isKeyWindow {
+        } else if NSApp.keyWindow != nil {
+            // Focus is somewhere in PopChat — the panel itself, Settings, or a
+            // popover. The hotkey means "go away" and must work in ONE press;
+            // keying on panel.isKeyWindow made the first press merely raise the
+            // panel over an open Settings window.
             dismiss()
         } else {
-            // Visible but unfocused (pinned mode): the hotkey pulls focus back first;
-            // a second press then dismisses.
+            // Visible but the app is unfocused (pinned mode — deactivation hides
+            // everything else): the hotkey pulls focus back first; a second
+            // press then dismisses.
             panel.makeKeyAndOrderFront(nil)
             state.focusBump += 1
         }
@@ -396,6 +405,10 @@ final class PanelController: NSObject, NSWindowDelegate {
         // Deferred one tick so the new key window is known: if key moved to another
         // PopChat window (file picker, settings), keep the panel; hide only when
         // focus left the app entirely (keyWindow becomes nil for an accessory app).
+        // This hook stays even though applicationDidResignActive also dismisses:
+        // the panel is NONACTIVATING, so panel-only use can leave the app never
+        // activated — resign-active would then never fire, and this is the only
+        // auto-hide the plain hotkey flow has.
         DispatchQueue.main.async { [weak self] in
             guard let self, !self.state.pinned else { return }
             if NSApp.keyWindow == nil {

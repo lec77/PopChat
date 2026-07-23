@@ -146,6 +146,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panelController.toggle()
     }
 
+    /// Clicking into another app dismisses ALL of PopChat — Settings included.
+    /// Both windows float above whatever the user switched to (the panel by
+    /// design, Settings because it must open over the floating panel), so
+    /// anything left behind hovers ON TOP of the other app and reads as stuck.
+    /// The Settings window is retained, so reopening it restores it exactly as
+    /// left — that is the copy-an-API-key flow. Pinning is the explicit
+    /// "keep it around" and exempts everything. Note the panel-only flow may
+    /// never activate the app at all (nonactivating panel); its auto-hide is
+    /// windowDidResignKey in PanelController, not this.
+    func applicationDidResignActive(_ notification: Notification) {
+        guard !panelController.isPinned else { return }
+        settingsWindow?.close()
+        panelController.hide()
+    }
+
     /// ⌘A/⌘C/⌘V/⌘X/⌘Z are MENU key equivalents on macOS, not text-view built-ins.
     /// An LSUIElement app never shows a menu bar, but NSApp.mainMenu is still
     /// consulted for key equivalents — without this invisible Edit menu, none of
